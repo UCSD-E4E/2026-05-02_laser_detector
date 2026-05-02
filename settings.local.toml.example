@@ -1,0 +1,10 @@
+# Copy to `settings.local.toml` (gitignored) for user-local non-secret config.
+# Overrides values in `settings.toml`. Credentials still go in `.secrets.toml`.
+
+[images]
+# Filesystem root under which Image.path from the SDK resolves.
+root = "/path/to/fishsense/images"
+
+# Override any other non-secret value here as needed, e.g.:
+# [run]
+# max_dives = 10

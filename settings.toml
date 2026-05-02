@@ -1,0 +1,53 @@
+# Phase 0 default settings — committed.
+#
+# Three-tier config (later tiers override earlier ones):
+#   1. settings.toml             (this file, committed)
+#   2. settings.local.toml       (gitignored, optional, for user-local paths)
+#   3. .secrets.toml             (gitignored, credentials only)
+#
+# Environment variables prefixed with `LASER_` override all three, e.g.
+# `LASER_RUN__MAX_DIVES=10` (note the double underscore for nested keys).
+
+# Top-level scalars must precede any [section] tables.
+rng_seed = 0
+
+[api]
+# Fishsense API endpoint. The public host (orchestrator.fishsense.e4e.ucsd.edu)
+# is fronted by Authentik OAuth which 302-redirects basic-auth requests; for
+# dev access use a port-forward to the internal API and put that URL here.
+# Username and password live in .secrets.toml (gitignored).
+base_url = "https://orchestrator.fishsense.e4e.ucsd.edu"
+max_concurrent_requests = 16
+timeout_seconds = 30
+
+[data]
+dir = "data/phase0"
+
+[images]
+# Filesystem root under which `Image.path` from the SDK resolves. ORF files
+# decode through fishsense-core; JPEG/PNG go through cv2.imread. Empty means
+# no image loading (the frame table, line fits, and splits still run; the
+# wavelength clustering and laser-size audit produce empty outputs).
+# User-local — set this in `settings.local.toml` or pass --image-root.
+root = ""
+
+[cache]
+# Where decoded images are cached as JPEGs (keyed by checksum). Decoding ORF
+# files via fishsense-core is slow (~hundreds of ms each), so re-runs read
+# from this cache instead. Gitignored.
+dir = "data/image_cache"
+jpeg_quality = 95
+
+[run]
+canonical_only = true
+# 0 disables the cap (process all dives). Set to a small number for dry runs.
+max_dives = 0
+
+[audit]
+sample_dives = 30
+samples_per_dive = 5
+
+[splits]
+seed = 0
+train_frac = 0.8
+val_frac = 0.1

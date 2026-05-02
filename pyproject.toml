@@ -1,0 +1,34 @@
+[project]
+name = "laser-detector"
+version = "0.1.0"
+description = "Laser-dot detector for fishsense dive imagery"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "dynaconf>=3.2.13",
+    "fishsense-api-sdk",
+    "fishsense-core",
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "polars>=1.40.1",
+    "pyarrow>=24.0.0",
+    "scikit-learn>=1.8.0",
+    "tqdm>=4.67.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.5,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+fishsense-api-sdk = { git = "https://github.com/UCSD-E4E/fishsense-lite.git", subdirectory = "libs/fishsense-api-sdk" }
+fishsense-core = { url = "https://github.com/UCSD-E4E/fishsense-core/releases/download/fishsense-core-v2.0.0/fishsense_core-2.0.0-cp313-cp313-manylinux_2_34_x86_64.whl" }
+
+[tool.uv.build-backend]
+module-name = "laser_detector"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
