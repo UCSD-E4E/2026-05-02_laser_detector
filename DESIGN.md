@@ -45,8 +45,8 @@ A post-processing detector that locates the laser dot in fishsense dive imagery.
 - **Per-dive count**: dozens of labels per dive (~30–50). Implies ~1,000–2,000 dives.
 - **Label format**: single `(x, y)` point per labeled frame.
 - **Negatives**: included; frames with no visible laser are explicitly labeled.
-- **Per-dive invariants**: each dive is single-color (green or blue) and uses a fixed-rig laser, so all positive labels in a dive are colinear in image space (modulo noise and label error).
-- **Laser blob size**: at z = 6 m, ~2.66 × 2.66 px without divergence (≈ 3 px diameter); with divergence ~6–8 px diameter. Closer objects produce larger blobs. **The 3 px floor drives the input-resolution choice in §4.1.**
+- **Per-dive invariants**: each dive is nominally single-color (**red or green** in the v1 corpus; the rig has moved to green-only going forward but a large red backlog remains) and uses a fixed-rig laser, so all positive labels in a dive are colinear in image space (modulo noise and label error). **Mixed-color dives exist (~42%)**: a dive labeled mostly "Red Laser" with a handful of "Green Laser" labels (or vice versa) is treated as the dominant color — the minority is almost always an annotator slip and is dropped/down-weighted by the line-fit outlier check (§3.1).
+- **Laser blob size**: phase-0 audit on 91 sampled positives (after `_segment_blob` was tightened to require the labeled pixel sit on a thresholded component and to reject blobs >25% of the patch area): **median 8 px, p10 3.6, p25 5, p75 13, p90 19, max 35**. Sliced by wavelength: **green** median 5.6 / p90 11; **red** median 11 / p90 19 — red is consistently ~2× larger across the distribution (real, due to either physical divergence in water or the close-range frames in red dives, not segmentation bias). The 3 px small-blob tail still drives the input-resolution choice in §4.1; the typical-blob radius drives σ in §4.3.
 - **File format**: Olympus ORF (Olympus Tough TG-6, 4K). Decoded via `fishsense-core`'s `RawImage` (rawpy → auto-gamma → CLAHE → 8-bit BGR) so this detector's input distribution matches the rest of the fishsense ecosystem. Decoded JPEGs are cached on disk (keyed by checksum) since ORF decode is slow.
 
 ### Rig assumptions
@@ -66,7 +66,7 @@ Not all labels are equal. Cleaning pass (described in §3) uses the colinearity 
 
 Frame-level splits would leak the per-dive line and wavelength priors (computed from labels) into validation. Dive-level holdout is non-negotiable.
 
-Stratify the split on the green/blue tag (computed in §3.2) so both colors are present in each set.
+Stratify the split on the wavelength tag (red/green, computed in §3.2) so both colors are present in each set.
 
 ---
 
@@ -85,18 +85,16 @@ For each dive, RANSAC-fit a 2D line through positive labels.
 
 Dives with `line_confidence < τ_line` are flagged "line-ambiguous" and excluded from prior-dependent steps. Threshold tuned on validation.
 
-**Label cleaning**: drop labels with perpendicular distance to the dive's line greater than `k * inlier_residual_std`, with `k ≈ 3`. Logged so we can audit dropped labels.
+**Label cleaning**: for each dive, compute `label_noise_mad = 1.4826 * MAD(perp_distance over all positive labels)` — a robust estimator of the population σ. Flag labels whose perpendicular distance exceeds `k * label_noise_mad`, with `k ≈ 3`. **Use `label_noise_mad`, not `residual_std`, for the threshold**: `residual_std` is computed on RANSAC inliers only, so it underestimates the true label-noise scale and would flag the RANSAC outliers a second time regardless of population spread. (`residual_std` is still kept as an inlier-tightness diagnostic for `is_line_confident`.) Phase-0 result: ~14.6% of positives flagged at k=3, mostly real label noise plus genuine minority-color labels in mixed dives.
 
 ### 3.2 Per-dive wavelength tag
 
-Each dive is single-color but the wavelength field isn't recorded. Recover it:
+Each dive is nominally single-color (red or green, see §2). The fishsense `LaserLabel.label` string usually carries the color word ("Red Laser" / "Green Laser"), so:
 
-1. For each labeled positive frame, sample a 5×5 patch around the labeled pixel; take the mean RGB.
-2. Average those means across all positive labels in the dive → one `dive_color` vector per dive.
-3. Cluster all `dive_color` vectors across the dataset with k=2 (or 3 if a third "ambiguous" cluster appears).
-4. Assign `green` / `blue` tag per dive based on which cluster centroid is greener vs. bluer.
+1. **Label-string majority** (primary): take the most common color word across the dive's positive labels. Mixed dives (~42% of the v1 corpus) are resolved by majority — the minority is almost always an annotator slip.
+2. **Color-cluster fallback**: if no label_string yields a color or the top two are tied, sample the brightest pixel in a 11×11 patch around each label, average across the dive to get a `dive_color` BGR vector, then KMeans-cluster k=2 across all such dives. The redder centroid (largest R−G) → "red"; the other → "green". Two-way clustering only — the v1 corpus has no blue dives.
 
-**Output per dive**: `wavelength ∈ {green, blue}`, plus the `dive_color` vector (kept for diagnostics).
+**Output per dive**: `wavelength ∈ {red, green}` (or None for the rare degenerate case), plus `wavelength_source ∈ {label_string, color_cluster}` and the `dive_color` BGR vector for diagnostics.
 
 For new dives at inference (cold start), the same procedure runs after enough high-confidence predictions accumulate. See §6.3.
 
@@ -146,7 +144,7 @@ For unknown dives, run all tiles.
 #### Other input pipeline
 
 - **Color preprocessing**: chromaticity normalization (divide RGB by intensity, clipped) applied as a preprocessing layer. Reduces sensitivity to underwater color attenuation.
-- **Wavelength conditioning**: one extra input channel set to `0.0` for green and `1.0` for blue. Concatenated to the chromaticity-normalized RGB → 4-channel input.
+- **Wavelength conditioning**: one extra input channel set to `0.0` for green and `1.0` for red (the two colors in the v1 corpus). Concatenated to the chromaticity-normalized RGB → 4-channel input. Cold-start dives (§6.3) get `0.5` until clustered.
 
 ### 4.2 Backbone
 
@@ -158,7 +156,7 @@ Both options TensorRT-port cleanly, so neither blocks the eventual UUV deploymen
 
 Two heads share the backbone, both operating on a single 1024 × 1024 tile:
 
-- **Heatmap head**: 1 channel, full tile resolution (1024 × 1024). Sigmoid activation. Target is a Gaussian centered at the labeled pixel (when in-crop) with a small fixed sigma (σ = 2 px at native resolution — matches the worst-case blob). Tiles without a label inside (negative-tile case) have an all-zero target.
+- **Heatmap head**: 1 channel, full tile resolution (1024 × 1024). Sigmoid activation. Target is a Gaussian centered at the labeled pixel (when in-crop). **Default σ ≈ 3 px** at native resolution — chosen from the (cleaned) Phase-0 blob audit: median diameter 8 px ⇒ radius ~4 px ⇒ σ at half-radius is ~2–3 px. Treat σ as a hyperparameter to sweep in [2, 5] px during Phase 4; the red-vs-green asymmetry (red blobs ~2× larger) suggests a wavelength-conditional σ may be warranted. A learned per-frame σ (predicted from local image statistics) is a Phase-3+ option if heatmap loss saturates. Tiles without a label inside (negative-tile case) have an all-zero target.
 - **Presence head** (per-tile): scalar logit. Mean-pooled feature from the bottleneck → small MLP → sigmoid. Trained on every tile.
 
 **Frame-level presence** is computed at inference: positive iff *any* tile's presence head fires above τ_presence (or equivalently, the merged heatmap's max exceeds threshold). The two are equivalent in practice; tracking both is cheap and useful for diagnostics.

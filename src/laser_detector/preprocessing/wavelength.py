@@ -1,21 +1,29 @@
-"""Per-dive wavelength inference (green vs. blue) by clustering label-site colors.
+"""Per-dive wavelength inference (red vs. green) for the v1 corpus.
 
-Each dive is single-color but the SDK doesn't record which one. We recover it:
-1. For each positive label, sample a small patch around the labeled pixel.
-2. Take the brightest-pixel color in the patch (the laser dominates).
-3. Average those colors across the dive → one color vector per dive.
-4. KMeans cluster dive vectors with k=2 → assign green/blue based on which
-   cluster centroid has more green vs. blue energy.
+Each dive is nominally single-color but the SDK doesn't record which one. The
+rig has moved to green-only going forward, but a large red backlog remains, so
+both must be first-class. ~42% of dives have *some* labels of the minority
+color; in practice those are annotator slips and the majority-color tag is the
+right one for the dive.
 
-If the SDK's `LaserLabel.label` string already contains color words (e.g.,
-"green", "blue") consistently across a dive, that wins — clustering is a
-fallback when the field is missing or unstructured.
+Resolution order per dive:
+1. **Label-string majority.** If `LaserLabel.label` strings carry color words,
+   the most common one wins (handles "Red Laser" / "Green Laser" labels and
+   the mixed-color case where one color dominates).
+2. **Color clustering (fallback).** If no label_string yields a color (or the
+   counts are tied), KMeans-cluster per-dive label-site colors with k=2 and
+   tag clusters by R−G: the redder centroid → "red", the other → "green".
+
+Blue is recognized in label_strings for forward-compat but the v1 corpus has
+no blue dives — clustering is two-way over red/green only.
 """
 
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import re
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import cv2
@@ -31,14 +39,28 @@ logger = logging.getLogger(__name__)
 
 PATCH_HALF_SIZE = 5  # 11x11 patch around the labeled pixel
 MAX_LABELS_PER_DIVE_FOR_COLOR = 10  # cap sampling for speed
+# ORF decode is CPU-bound enough that threads stall on the GIL inside the
+# Python wrapping around rawpy/CLAHE. Each worker process gets its own GIL.
+# 32 keeps headroom on the 128-logical-core dev box.
+DEFAULT_N_WORKERS = 32
 
+# Process-local loader, set by `_init_worker` so it isn't pickled per call.
+_WORKER_LOADER: ImageLoader | None = None
+
+
+def _init_worker(loader: ImageLoader) -> None:
+    global _WORKER_LOADER
+    _WORKER_LOADER = loader
+
+RED_PATTERN = re.compile(r"\bred\b", re.IGNORECASE)
 GREEN_PATTERN = re.compile(r"\bgreen\b", re.IGNORECASE)
 BLUE_PATTERN = re.compile(r"\bblue\b", re.IGNORECASE)
+_COLOR_PATTERNS = {"red": RED_PATTERN, "green": GREEN_PATTERN, "blue": BLUE_PATTERN}
 
 
 WAVELENGTH_TABLE_SCHEMA = {
     "dive_id": pl.Int64,
-    "wavelength": pl.Utf8,  # "green", "blue", or None if undetermined
+    "wavelength": pl.Utf8,  # "red", "green", "blue", or None if undetermined
     "wavelength_source": pl.Utf8,  # "label_string" or "color_cluster"
     "dive_color_b": pl.Float64,  # mean BGR of label sites (cv2 convention)
     "dive_color_g": pl.Float64,
@@ -50,19 +72,26 @@ WAVELENGTH_TABLE_SCHEMA = {
 class _DiveColor:
     dive_id: int
     color_bgr: np.ndarray  # shape (3,)
-    label_string_green: int
-    label_string_blue: int
 
 
 def _wavelength_from_labels(label_strings: list[str | None]) -> str | None:
-    """If label strings unambiguously say green or blue across a dive, use that."""
-    has_green = any(s and GREEN_PATTERN.search(s) for s in label_strings)
-    has_blue = any(s and BLUE_PATTERN.search(s) for s in label_strings)
-    if has_green and not has_blue:
-        return "green"
-    if has_blue and not has_green:
-        return "blue"
-    return None
+    """Return the majority color word in this dive's label strings.
+
+    Mixed dives are common (~42% of the v1 corpus): a dive labeled "Red Laser"
+    100× plus "Green Laser" 2× is treated as red — the minority is almost
+    always an annotator slip. Returns None if no color words appear or if the
+    top two are tied (in which case the caller falls back to color clustering).
+    """
+    counts = {
+        color: sum(1 for s in label_strings if s and pattern.search(s))
+        for color, pattern in _COLOR_PATTERNS.items()
+    }
+    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+    top_color, top_count = ranked[0]
+    second_count = ranked[1][1]
+    if top_count == 0 or top_count == second_count:
+        return None
+    return top_color
 
 
 def _sample_label_color(
@@ -107,57 +136,81 @@ def _compute_dive_color(
         colors.append(color)
     if not colors:
         return None
-
-    label_strings = positives["label_string"].to_list()
     return _DiveColor(
         dive_id=dive_id,
         color_bgr=np.mean(np.stack(colors), axis=0),
-        label_string_green=sum(
-            1 for s in label_strings if s and GREEN_PATTERN.search(s)
-        ),
-        label_string_blue=sum(
-            1 for s in label_strings if s and BLUE_PATTERN.search(s)
-        ),
     )
 
 
 def _assign_clusters(dive_colors: list[_DiveColor]) -> dict[int, str]:
-    """KMeans-cluster dive colors and map clusters to "green"/"blue"."""
+    """KMeans-cluster dive colors and map clusters to "red"/"green".
+
+    Two-way clustering for the v1 corpus. The redder centroid (largest R−G in
+    BGR) is "red"; the other is "green". No blue cluster — the v1 corpus has
+    no blue dives.
+    """
     if len(dive_colors) < 2:
         return {}
     matrix = np.stack([dc.color_bgr for dc in dive_colors])
     kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(matrix)
     centers = kmeans.cluster_centers_  # rows are BGR
-    # Greener centroid: G - max(B, R) is largest
-    green_idx = int(np.argmax(centers[:, 1] - np.maximum(centers[:, 0], centers[:, 2])))
-    blue_idx = 1 - green_idx
-    cluster_to_color = {green_idx: "green", blue_idx: "blue"}
+    redness = centers[:, 2] - centers[:, 1]  # R - G
+    red_idx = int(np.argmax(redness))
+    green_idx = 1 - red_idx
+    cluster_to_color = {red_idx: "red", green_idx: "green"}
     return {
         dc.dive_id: cluster_to_color[int(label)]
         for dc, label in zip(dive_colors, kmeans.labels_)
     }
 
 
+def _process_dive(item: tuple) -> tuple[int, str | None, "_DiveColor | None"]:
+    """Worker entry point for the process pool. Reads the loader from
+    `_WORKER_LOADER`, set once at worker startup by `_init_worker`."""
+    (dive_id_t,), group = item
+    dive_id = int(dive_id_t)
+    labels = group.filter(pl.col("is_positive"))["label_string"].to_list()
+    from_labels = _wavelength_from_labels(labels)
+    dive_color = _compute_dive_color(dive_id, group, _WORKER_LOADER)
+    return dive_id, from_labels, dive_color
+
+
 def infer_wavelengths(
     frames: pl.DataFrame,
     loader: ImageLoader,
+    *,
+    n_workers: int = DEFAULT_N_WORKERS,
 ) -> pl.DataFrame:
-    """Per-dive wavelength inference. Returns one row per dive."""
+    """Per-dive wavelength inference. Returns one row per dive.
+
+    `n_workers` parallelizes per-dive image loads via a process pool — ORF
+    decode is CPU-bound enough that threads stall on the GIL.
+    """
     rows: list[dict] = []
     dive_colors: list[_DiveColor] = []
     label_string_assignments: dict[int, str] = {}
 
     grouped = list(frames.group_by("dive_id"))
-    for (dive_id_t,), group in tqdm(grouped, desc="wavelength: per-dive color"):
-        dive_id = int(dive_id_t)
-        labels = group.filter(pl.col("is_positive"))["label_string"].to_list()
-        from_labels = _wavelength_from_labels(labels)
-        if from_labels is not None:
-            label_string_assignments[dive_id] = from_labels
 
-        dive_color = _compute_dive_color(dive_id, group, loader)
-        if dive_color is not None:
-            dive_colors.append(dive_color)
+    # forkserver instead of fork — polars/numpy/cv2 init thread pools in the
+    # parent before this point, and inheriting that pthread state across fork()
+    # deadlocks the workers. forkserver forks from a clean intermediate process.
+    mp_context = multiprocessing.get_context("forkserver")
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        mp_context=mp_context,
+        initializer=_init_worker,
+        initargs=(loader,),
+    ) as ex:
+        for dive_id, from_labels, dive_color in tqdm(
+            ex.map(_process_dive, grouped),
+            total=len(grouped),
+            desc="wavelength: per-dive color",
+        ):
+            if from_labels is not None:
+                label_string_assignments[dive_id] = from_labels
+            if dive_color is not None:
+                dive_colors.append(dive_color)
 
     cluster_assignments = _assign_clusters(dive_colors) if dive_colors else {}
     color_by_id = {dc.dive_id: dc.color_bgr for dc in dive_colors}

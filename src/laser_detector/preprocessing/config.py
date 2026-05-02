@@ -52,6 +52,27 @@ settings = Dynaconf(
             condition=lambda v: bool(v),
             messages={"condition": "api.password must be set in .secrets.toml"},
         ),
+        Validator(
+            "mlflow.tracking_uri",
+            must_exist=True,
+            is_type_of=str,
+            condition=lambda v: bool(v),
+            messages={"condition": "mlflow.tracking_uri must be set in settings.toml"},
+        ),
+        Validator(
+            "mlflow.username",
+            must_exist=True,
+            is_type_of=str,
+            condition=lambda v: bool(v),
+            messages={"condition": "mlflow.username must be set in .secrets.toml"},
+        ),
+        Validator(
+            "mlflow.token",
+            must_exist=True,
+            is_type_of=str,
+            condition=lambda v: bool(v),
+            messages={"condition": "mlflow.token must be set in .secrets.toml"},
+        ),
         Validator("api.max_concurrent_requests", is_type_of=int, gte=1),
         Validator("api.timeout_seconds", is_type_of=int, gte=1),
         Validator("data.dir", must_exist=True, is_type_of=str),
@@ -63,6 +84,7 @@ settings = Dynaconf(
         ),
         Validator("run.canonical_only", is_type_of=bool),
         Validator("run.max_dives", is_type_of=int, gte=0),
+        Validator("run.image_workers", is_type_of=int, gte=1),
         Validator("audit.sample_dives", is_type_of=int, gte=0),
         Validator("audit.samples_per_dive", is_type_of=int, gte=0),
         Validator("splits.seed", is_type_of=int),
@@ -99,6 +121,7 @@ class Phase0Config:
     # Run controls
     max_dives: int | None
     canonical_only: bool
+    image_workers: int
 
     # Laser-size audit
     audit_sample_dives: int
@@ -111,6 +134,11 @@ class Phase0Config:
 
     # Reproducibility
     rng_seed: int
+
+    # MLflow tracking server (basic auth via mlflow-oidc-auth plugin)
+    mlflow_tracking_uri: str
+    mlflow_username: str
+    mlflow_token: str
 
 
 def load_config() -> Phase0Config:
@@ -139,10 +167,14 @@ def load_config() -> Phase0Config:
         cache_jpeg_quality=int(settings["cache.jpeg_quality"]),
         max_dives=raw_max_dives if raw_max_dives > 0 else None,
         canonical_only=bool(settings["run.canonical_only"]),
+        image_workers=int(settings["run.image_workers"]),
         audit_sample_dives=int(settings["audit.sample_dives"]),
         audit_samples_per_dive=int(settings["audit.samples_per_dive"]),
         split_seed=int(settings["splits.seed"]),
         split_train_frac=float(settings["splits.train_frac"]),
         split_val_frac=float(settings["splits.val_frac"]),
         rng_seed=int(settings["rng_seed"]),
+        mlflow_tracking_uri=str(settings["mlflow.tracking_uri"]),
+        mlflow_username=str(settings["mlflow.username"]),
+        mlflow_token=str(settings["mlflow.token"]),
     )

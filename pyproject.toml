@@ -3,11 +3,12 @@ name = "laser-detector"
 version = "0.1.0"
 description = "Laser-dot detector for fishsense dive imagery"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "dynaconf>=3.2.13",
     "fishsense-api-sdk",
     "fishsense-core",
+    "mlflow-skinny>=3.11.1",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "polars>=1.40.1",

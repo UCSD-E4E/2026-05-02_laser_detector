@@ -41,6 +41,16 @@ RANSAC_MAX_ITERS = 200
 LINE_CONFIDENCE_THRESHOLD = 5.0
 
 
+# MAD → consistent estimator of σ for normally distributed residuals.
+MAD_TO_SIGMA = 1.4826
+
+# Floor on the MAD-derived σ used by `flag_label_outliers`. On very small dives
+# whose RANSAC inliers happen to be sub-pixel-tight, MAD collapses to ~0 and
+# every label gets flagged. Labels can't reasonably be more precise than ~1 px
+# at native 4K resolution, so any threshold below this is non-physical.
+LABEL_NOISE_MAD_FLOOR_PX = 1.0
+
+
 @dataclass
 class LineFit:
     """A normalized line `a*x + b*y + c = 0` plus quality metrics."""
@@ -51,7 +61,8 @@ class LineFit:
     n_points: int
     inlier_count: int
     inlier_fraction: float
-    residual_std: float  # perp-distance std among inliers, in px
+    residual_std: float  # perp-distance std among inliers, in px (RANSAC tightness)
+    label_noise_mad: float  # 1.4826 * MAD over ALL positive labels' perp distance, in px
     line_confidence: float  # along-line spread / perp spread (covariance eigenratio)
 
     def perpendicular_distance(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -153,9 +164,15 @@ def fit_dive_line(
     n = xy.shape[0]
     inlier_count = int(inliers.sum())
 
-    dist = np.abs(a * inlier_xy[:, 0] + b * inlier_xy[:, 1] + c)
-    residual_std = float(np.std(dist))
+    dist_inliers = np.abs(a * inlier_xy[:, 0] + b * inlier_xy[:, 1] + c)
+    residual_std = float(np.std(dist_inliers))
     confidence = _line_confidence(inlier_xy, a, b)
+
+    # MAD on ALL positive labels — the population the outlier flag will be applied
+    # against. residual_std is bounded by the RANSAC tolerance and so under-states
+    # true label-noise scale; MAD is robust to the gross outliers in the tail.
+    dist_all = np.abs(a * xy[:, 0] + b * xy[:, 1] + c)
+    label_noise_mad = float(MAD_TO_SIGMA * np.median(np.abs(dist_all - np.median(dist_all))))
 
     return LineFit(
         a=a,
@@ -165,6 +182,7 @@ def fit_dive_line(
         inlier_count=inlier_count,
         inlier_fraction=inlier_count / n,
         residual_std=residual_std,
+        label_noise_mad=label_noise_mad,
         line_confidence=confidence,
     )
 
@@ -178,6 +196,7 @@ LINE_TABLE_SCHEMA = {
     "inlier_count": pl.Int64,
     "inlier_fraction": pl.Float64,
     "residual_std": pl.Float64,
+    "label_noise_mad": pl.Float64,
     "line_confidence": pl.Float64,
     "is_line_confident": pl.Boolean,
 }
@@ -218,6 +237,7 @@ def fit_lines_per_dive(
                     "inlier_count": None,
                     "inlier_fraction": None,
                     "residual_std": None,
+                    "label_noise_mad": None,
                     "line_confidence": None,
                     "is_line_confident": False,
                 }
@@ -233,6 +253,7 @@ def fit_lines_per_dive(
                 "inlier_count": fit.inlier_count,
                 "inlier_fraction": fit.inlier_fraction,
                 "residual_std": fit.residual_std,
+                "label_noise_mad": fit.label_noise_mad,
                 "line_confidence": fit.line_confidence,
                 "is_line_confident": fit.line_confidence >= confidence_threshold,
             }
@@ -254,18 +275,28 @@ def flag_label_outliers(
     line_table: pl.DataFrame,
     *,
     sigma: float = 3.0,
+    mad_floor_px: float = LABEL_NOISE_MAD_FLOOR_PX,
 ) -> pl.DataFrame:
     """Add a `label_is_outlier` column to the frame table.
 
     For each positive label, compute perpendicular distance to its dive's line
-    and flag rows where distance > sigma * residual_std (only for dives with a
-    confident line). Outliers are *flagged*, not dropped — downstream code
-    decides whether to drop or down-weight them.
+    and flag rows where distance > sigma * max(label_noise_mad, mad_floor_px),
+    only for dives with a confident line. `label_noise_mad` is a robust
+    estimate of the population σ over all positive labels; using it instead of
+    `residual_std` avoids the inlier-conditioning that would otherwise re-flag
+    the RANSAC outliers as "≥3σ" outliers regardless of true label-noise
+    scale. The floor handles small-N dives where MAD collapses to sub-pixel
+    values and would otherwise flag every label.
     """
     # Join line params onto frames
     joined = frames.join(
         line_table.select(
-            "dive_id", "line_a", "line_b", "line_c", "residual_std", "is_line_confident"
+            "dive_id",
+            "line_a",
+            "line_b",
+            "line_c",
+            "label_noise_mad",
+            "is_line_confident",
         ),
         on="dive_id",
         how="left",
@@ -278,12 +309,15 @@ def flag_label_outliers(
         + pl.col("line_c")
     ).abs()
 
-    outlier_threshold = sigma * pl.col("residual_std")
+    effective_mad = pl.max_horizontal(
+        pl.col("label_noise_mad"), pl.lit(mad_floor_px, dtype=pl.Float64)
+    )
+    outlier_threshold = sigma * effective_mad
     flagged = joined.with_columns(
         pl.when(
             pl.col("is_positive")
             & pl.col("is_line_confident")
-            & pl.col("residual_std").is_not_null()
+            & pl.col("label_noise_mad").is_not_null()
         )
         .then(perp_dist > outlier_threshold)
         .otherwise(False)
@@ -293,8 +327,11 @@ def flag_label_outliers(
 
     n_outliers = flagged.filter(pl.col("label_is_outlier")).height
     logger.info(
-        "Flagged %d outlier labels (>%.1fσ from dive line)", n_outliers, sigma
+        "Flagged %d outlier labels (>%.1fσ; σ=max(MAD*1.4826, %.1f px))",
+        n_outliers,
+        sigma,
+        mad_floor_px,
     )
     return flagged.drop(
-        ["line_a", "line_b", "line_c", "residual_std", "is_line_confident"]
+        ["line_a", "line_b", "line_c", "label_noise_mad", "is_line_confident"]
     )

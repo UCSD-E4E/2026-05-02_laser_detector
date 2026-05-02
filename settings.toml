@@ -42,6 +42,10 @@ jpeg_quality = 95
 canonical_only = true
 # 0 disables the cap (process all dives). Set to a small number for dry runs.
 max_dives = 0
+# Process-pool worker count for the wavelength + audit steps. ORF decode is
+# CPU-bound; 32 is a balanced default for the dev box (128 logical cores).
+# Lower this on smaller machines.
+image_workers = 32
 
 [audit]
 sample_dives = 30
@@ -51,3 +55,6 @@ samples_per_dive = 5
 seed = 0
 train_frac = 0.8
 val_frac = 0.1
+
+[mlflow]
+tracking_uri = "https://mlflow.krg.ucsd.edu"

@@ -86,7 +86,9 @@ def run_phase0(
     # 3. Per-dive wavelength inference (needs image bytes; falls back to label_string)
     wavelengths = _read_or_compute(
         config.data_dir / WAVELENGTHS_FILE,
-        lambda: infer_wavelengths(frames, image_loader),
+        lambda: infer_wavelengths(
+            frames, image_loader, n_workers=config.image_workers
+        ),
         force=force,
         label="dive wavelengths",
     )
@@ -101,6 +103,7 @@ def run_phase0(
             sample_dives=config.audit_sample_dives,
             samples_per_dive=config.audit_samples_per_dive,
             rng_seed=config.rng_seed,
+            n_workers=config.image_workers,
         ),
         force=force,
         label="laser-size audit",
@@ -114,6 +117,7 @@ def run_phase0(
             train_frac=config.split_train_frac,
             val_frac=config.split_val_frac,
             seed=config.split_seed,
+            frames=frames,
         ),
         force=force,
         label="dive splits",

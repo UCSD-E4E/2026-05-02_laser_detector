@@ -89,6 +89,49 @@ def test_fit_lines_per_dive_flags_low_confidence_for_clustered_points():
     assert lines.filter(pl.col("is_line_confident")).height == 0
 
 
+def test_flag_label_outliers_mad_floor_protects_tiny_dives():
+    """Small-N dives with sub-pixel-tight inliers used to have every label
+    flagged because MAD collapsed to ~0 and `3 * MAD` was below realistic label
+    precision. The MAD floor (default 1.0 px) prevents that collapse: a 0.5 px
+    near-miss is kept, a 10 px outlier is still flagged."""
+    rows = []
+    # 6 perfectly-colinear points (MAD = 0)
+    for i, t in enumerate(np.linspace(-300, 300, 6)):
+        rows.append({
+            "dive_id": 0, "image_id": i, "rig_id": 1,
+            "image_path": f"d/{i}.jpg", "image_checksum": f"s{i}",
+            "label_x": float(1000.0 + t), "label_y": 1000.0,
+            "is_positive": True, "label_string": None,
+            "label_studio_task_id": None, "label_studio_project_id": None,
+            "superseded": False, "completed": True,
+        })
+    # A near-miss at 0.5 px — well within the floor (3 * 1 = 3 px threshold)
+    rows.append({
+        "dive_id": 0, "image_id": 100, "rig_id": 1,
+        "image_path": "d/near.jpg", "image_checksum": "near",
+        "label_x": 1100.0, "label_y": 1000.5,
+        "is_positive": True, "label_string": None,
+        "label_studio_task_id": None, "label_studio_project_id": None,
+        "superseded": False, "completed": True,
+    })
+    # A clear outlier at 10 px — must still be flagged
+    rows.append({
+        "dive_id": 0, "image_id": 101, "rig_id": 1,
+        "image_path": "d/far.jpg", "image_checksum": "far",
+        "label_x": 1200.0, "label_y": 1010.0,
+        "is_positive": True, "label_string": None,
+        "label_studio_task_id": None, "label_studio_project_id": None,
+        "superseded": False, "completed": True,
+    })
+    frames = pl.DataFrame(rows, schema=FRAME_TABLE_SCHEMA)
+    lines = fit_lines_per_dive(frames, seed=0)
+    flagged = flag_label_outliers(frames, lines)
+    flagged_ids = set(
+        flagged.filter(pl.col("label_is_outlier"))["image_checksum"].to_list()
+    )
+    assert flagged_ids == {"far"}, f"expected only the 10px outlier flagged, got {flagged_ids}"
+
+
 def test_flag_label_outliers_marks_off_line_points():
     frames = _make_synthetic_frames(n_dives=2, points_per_dive=30, spread=400, seed=3)
     # Inject one obvious outlier per dive
@@ -150,7 +193,14 @@ def test_make_dive_splits_stratifies_by_wavelength():
 
 
 def test_wavelength_from_labels_recognizes_color_words():
+    # Single-color cases (the common path on the v1 corpus)
+    assert _wavelength_from_labels(["Red Laser", "Red Laser", None]) == "red"
     assert _wavelength_from_labels(["laser-green", "green laser", None]) == "green"
     assert _wavelength_from_labels(["blue laser", "Blue", "blue"]) == "blue"
-    assert _wavelength_from_labels(["green", "blue"]) is None  # ambiguous
+    # Mixed-color dive: majority wins (annotator-slip pattern is real)
+    assert _wavelength_from_labels(["Red Laser"] * 146 + ["Green Laser"] * 2) == "red"
+    assert _wavelength_from_labels(["Green Laser"] * 8 + ["Red Laser"] * 210) == "red"
+    # Tied majority → caller falls back to clustering
+    assert _wavelength_from_labels(["red", "green"]) is None
+    # No color words present → caller falls back to clustering
     assert _wavelength_from_labels([None, None, "no laser"]) is None
