@@ -244,9 +244,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         def _on_epoch(epoch, metrics, ckpt_path, improved):
+            # Per-epoch metrics are stepped by epoch index; per-step metrics
+            # below use the global batch count, so they live in separate
+            # series and don't collide.
             mlflow.log_metrics(metrics, step=epoch)
             if improved:
                 mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints/best")
+
+        def _on_step(global_step, step_metrics):
+            mlflow.log_metrics(step_metrics, step=global_step)
 
         artifacts = train(
             cfg=cfg,
@@ -256,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             epoch_callback=_on_epoch,
+            step_callback=_on_step,
             ddp=ddp,
         )
 

@@ -81,6 +81,11 @@ class TrainConfig:
     # val pass at the end produces the canonical metrics.
     val_subsample_per_epoch: int = 200
     val_subsample_seed: int = 0
+    # Per-step metric logging cadence (rank-0 only). 0 disables it; default 50
+    # gives ~850 data points across a 10-epoch full-corpus run, which renders
+    # as a smooth loss curve in MLflow / TensorBoard. Per-epoch metrics are
+    # logged separately via epoch_callback.
+    log_every_n_steps: int = 50
 
 
 @dataclass
@@ -161,11 +166,15 @@ def _train_one_epoch(
     device: torch.device,
     epoch: int,
     ddp: DDPContext,
-) -> dict[str, float]:
+    *,
+    global_step_start: int = 0,
+    step_callback=None,
+) -> tuple[dict[str, float], int]:
     model.train()
     autocast_dtype = torch.bfloat16 if cfg.use_bf16 and device.type == "cuda" else None
     sums = {"loss": 0.0, "loss_heatmap": 0.0, "loss_presence": 0.0}
     n_batches = 0
+    global_step = int(global_step_start)
 
     iterator = (
         tqdm(loader, desc=f"epoch {epoch} train", leave=False)
@@ -207,15 +216,33 @@ def _train_one_epoch(
         optimizer.step()
         scheduler.step()
 
-        sums["loss"] += float(loss.item())
-        sums["loss_heatmap"] += float(loss_hm.item())
-        sums["loss_presence"] += float(loss_pres.item())
+        loss_val = float(loss.item())
+        loss_hm_val = float(loss_hm.item())
+        loss_pres_val = float(loss_pres.item())
+        sums["loss"] += loss_val
+        sums["loss_heatmap"] += loss_hm_val
+        sums["loss_presence"] += loss_pres_val
         n_batches += 1
+        global_step += 1
         if pbar is not None and n_batches % 20 == 0:
             pbar.set_postfix(
                 loss=f"{sums['loss'] / n_batches:.4f}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
+        # Per-step metrics for the loss curve. Rank-0 only (avoids 4× duplicate
+        # log entries) and only every N steps to keep MLflow API traffic sane.
+        if (
+            step_callback is not None
+            and ddp.is_main
+            and cfg.log_every_n_steps > 0
+            and global_step % cfg.log_every_n_steps == 0
+        ):
+            step_callback(global_step, {
+                "step_loss": loss_val,
+                "step_loss_heatmap": loss_hm_val,
+                "step_loss_presence": loss_pres_val,
+                "lr": float(scheduler.get_last_lr()[0]),
+            })
 
     means = {k: v / max(n_batches, 1) for k, v in sums.items()}
     # Average across ranks so the logged number reflects global behavior, not
@@ -227,7 +254,7 @@ def _train_one_epoch(
         means["loss"], means["loss_heatmap"], means["loss_presence"] = (
             float(t[0]), float(t[1]), float(t[2]),
         )
-    return means
+    return means, global_step
 
 
 def _build_epoch_val_subsample(
@@ -482,6 +509,7 @@ def train(
     lines: pl.DataFrame,
     checkpoint_dir: Path,
     epoch_callback=None,
+    step_callback=None,
     ddp: DDPContext | None = None,
 ) -> TrainArtifacts:
     """Train the Phase 2 model. Caller is responsible for MLflow setup +
@@ -583,11 +611,13 @@ def train(
             len(epoch_val_records), len(val_records),
         )
 
+    global_step = 0
     for epoch in range(cfg.epochs):
         sampler.set_epoch(epoch)
         t0 = time.monotonic()
-        train_metrics = _train_one_epoch(
+        train_metrics, global_step = _train_one_epoch(
             model, train_loader, optimizer, scheduler, cfg, device, epoch, ddp,
+            global_step_start=global_step, step_callback=step_callback,
         )
         train_elapsed = time.monotonic() - t0
 
