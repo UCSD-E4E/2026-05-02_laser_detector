@@ -5,6 +5,7 @@ description = "Laser-dot detector for fishsense dive imagery"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "albumentations>=2.0.8",
     "dynaconf>=3.2.13",
     "fishsense-api-sdk",
     "fishsense-core",
@@ -14,6 +15,10 @@ dependencies = [
     "polars>=1.40.1",
     "pyarrow>=24.0.0",
     "scikit-learn>=1.8.0",
+    "segmentation-models-pytorch>=0.5.0",
+    "torch>=2.11.0",
+    "torchmetrics>=1.9.0",
+    "torchvision>=0.26.0",
     "tqdm>=4.67.3",
 ]
 

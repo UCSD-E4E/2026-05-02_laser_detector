@@ -1,0 +1,272 @@
+"""CLI to run Phase 2 supervised training + log to MLflow.
+
+Loads the Phase 0 artifacts (frames, splits, wavelengths, lines), builds
+per-frame `FrameRecord` lists for the train and val splits, sets up MLflow,
+and runs `train.train()` with an `epoch_callback` that logs per-epoch metrics
+and snapshots the best checkpoint as a run artifact.
+
+Usage (single GPU):
+    uv run python scripts/run_train.py
+    uv run python scripts/run_train.py --epochs 5 --batch-size 8 --max-train-dives 4 --max-val-dives 2
+
+Usage (multi-GPU DDP):
+    uv run torchrun --standalone --nproc_per_node=4 scripts/run_train.py --epochs 10 --batch-size 16
+
+Under torchrun the per-rank batch size is `--batch-size`, so the global batch
+becomes `batch_size * world_size`. MLflow logging, checkpoints, and the
+final-val pass run on rank 0; all ranks participate in train + val inference.
+
+Smoke-run flags (`--max-*-dives`, `--max-*-frames`) restrict the dataset
+without changing behavior, so a quick end-to-end sanity check costs minutes
+rather than hours. The same `--no-mlflow` flag as the baseline runner is
+useful when iterating locally.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+import mlflow
+import polars as pl
+
+from laser_detector.data import build_records
+from laser_detector.preprocessing.config import load_config
+from laser_detector.preprocessing.image_loader import (
+    CachingImageLoader,
+    LocalFilesystemImageLoader,
+)
+from laser_detector.tracking import setup_mlflow
+from laser_detector.train import TrainConfig, init_distributed, shutdown_distributed, train
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train Phase 2 detector + log to MLflow")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader per-worker prefetch buffer. Drop to 1 when the cache "
+        "working set is close to RAM capacity to reduce page-cache thrashing.",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=1000,
+        help="Linear LR warmup steps. Overrides warmup_epochs. "
+        "Default 1000 — fits the full-corpus run; smoke runs can leave it as-is "
+        "(it caps at the schedule total).",
+    )
+    parser.add_argument(
+        "--max-train-dives",
+        type=int,
+        default=0,
+        help="Cap on train-split dives for smoke runs. 0 = no cap.",
+    )
+    parser.add_argument(
+        "--max-val-dives",
+        type=int,
+        default=0,
+        help="Cap on val-split dives for smoke runs. 0 = no cap.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=Path("data/phase2/checkpoints"),
+    )
+    parser.add_argument(
+        "--no-mlflow",
+        action="store_true",
+        help="Skip MLflow setup and just print per-epoch metrics.",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--heatmap-loss",
+        choices=("bce", "focal"),
+        default="bce",
+        help="Heatmap loss formulation. BCE+pos_weight is default after the "
+        "2026-05-03 focal collapse; focal is kept for ablation.",
+    )
+    parser.add_argument(
+        "--heatmap-pos-weight",
+        type=float,
+        default=1000.0,
+        help="pos_weight for BCE heatmap loss. Counterweights the "
+        "1-pos-pixel-vs-1M-neg-pixel imbalance per tile.",
+    )
+    return parser.parse_args(argv)
+
+
+def _split_records(
+    *,
+    frames: pl.DataFrame,
+    splits: pl.DataFrame,
+    wavelengths: pl.DataFrame,
+    split: str,
+    max_dives: int,
+):
+    dive_ids = (
+        splits.filter(pl.col("split") == split)["dive_id"].unique().to_list()
+    )
+    if max_dives > 0:
+        dive_ids = dive_ids[:max_dives]
+    split_frames = frames.filter(pl.col("dive_id").is_in(dive_ids))
+    return build_records(split_frames, wavelengths), dive_ids, split_frames.height
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    ddp = init_distributed()
+    # Rank 0 logs at INFO; non-zero ranks at WARNING so the console isn't
+    # flooded with `world_size` copies of every progress message.
+    logging.basicConfig(
+        level=logging.INFO if ddp.is_main else logging.WARNING,
+        format=f"%(asctime)s [r{ddp.rank}] [%(levelname)s] %(name)s: %(message)s",
+    )
+    config = load_config()
+
+    if config.image_root is None:
+        logging.error(
+            "No image root configured. Training needs image bytes; "
+            "set `images.root` in settings.local.toml."
+        )
+        return 2
+
+    inner = LocalFilesystemImageLoader(config.image_root)
+    image_loader = CachingImageLoader(
+        inner=inner,
+        cache_dir=config.cache_dir,
+        jpeg_quality=config.cache_jpeg_quality,
+    )
+
+    frames = pl.read_parquet(config.data_dir / "frames.parquet")
+    splits = pl.read_parquet(config.data_dir / "dive_splits.parquet")
+    wavelengths = pl.read_parquet(config.data_dir / "dive_wavelengths.parquet")
+    lines = pl.read_parquet(config.data_dir / "dive_lines.parquet")
+
+    train_records, train_dives, n_train = _split_records(
+        frames=frames, splits=splits, wavelengths=wavelengths,
+        split="train", max_dives=args.max_train_dives,
+    )
+    val_records, val_dives, n_val = _split_records(
+        frames=frames, splits=splits, wavelengths=wavelengths,
+        split="val", max_dives=args.max_val_dives,
+    )
+    if ddp.is_main:
+        logging.info(
+            "Train: %d dives, %d frames | Val: %d dives, %d frames",
+            len(train_dives), n_train, len(val_dives), n_val,
+        )
+
+    # When --max-*-dives caps the records, restrict the splits frame the
+    # trainer hands to evaluate() so it doesn't score against the full val
+    # set (every uninferenced dive would count as a miss).
+    sampled_dives = set(train_dives) | set(val_dives)
+    eval_splits = splits.filter(pl.col("dive_id").is_in(list(sampled_dives)))
+
+    cfg = TrainConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        warmup_steps=args.warmup_steps,
+        seed=args.seed,
+        heatmap_loss=args.heatmap_loss,
+        heatmap_pos_weight=args.heatmap_pos_weight,
+    )
+
+    if args.no_mlflow:
+        train(
+            cfg=cfg,
+            train_records=train_records,
+            val_records=val_records,
+            image_loader=image_loader,
+            frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
+            checkpoint_dir=args.checkpoint_dir,
+            ddp=ddp,
+        )
+        shutdown_distributed()
+        return 0
+
+    # Only rank 0 talks to MLflow. Other ranks run training without a run
+    # context — the trainer's epoch_callback hands metrics to whichever
+    # rank wraps the call, and the non-zero ranks pass `None` callback.
+    if not ddp.is_main:
+        train(
+            cfg=cfg,
+            train_records=train_records,
+            val_records=val_records,
+            image_loader=image_loader,
+            frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
+            checkpoint_dir=args.checkpoint_dir,
+            ddp=ddp,
+        )
+        shutdown_distributed()
+        return 0
+
+    setup_mlflow(config)
+    with mlflow.start_run(run_name="phase2_train") as run:
+        mlflow.set_tag("phase", "phase2_train")
+        mlflow.set_tag("detector", "resnet34_unet_heatmap")
+        mlflow.set_tag("world_size", str(ddp.world_size))
+        mlflow.log_params(
+            {
+                **cfg.__dict__,
+                "world_size": ddp.world_size,
+                "global_batch_size": cfg.batch_size * ddp.world_size,
+                "n_train_dives": len(train_dives),
+                "n_train_frames": n_train,
+                "n_val_dives": len(val_dives),
+                "n_val_frames": n_val,
+                "max_train_dives": args.max_train_dives,
+                "max_val_dives": args.max_val_dives,
+            }
+        )
+
+        def _on_epoch(epoch, metrics, ckpt_path, improved):
+            mlflow.log_metrics(metrics, step=epoch)
+            if improved:
+                mlflow.log_artifact(str(ckpt_path), artifact_path="checkpoints/best")
+
+        artifacts = train(
+            cfg=cfg,
+            train_records=train_records,
+            val_records=val_records,
+            image_loader=image_loader,
+            frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
+            checkpoint_dir=args.checkpoint_dir,
+            epoch_callback=_on_epoch,
+            ddp=ddp,
+        )
+
+        if artifacts.best_checkpoint_path is not None:
+            mlflow.log_metrics(
+                {f"best_{k}": v for k, v in artifacts.best_metrics.items() if isinstance(v, (int, float))},
+            )
+        if artifacts.latency_metrics:
+            mlflow.log_metrics(artifacts.latency_metrics)
+        if artifacts.final_metrics:
+            mlflow.log_metrics(
+                {k: v for k, v in artifacts.final_metrics.items() if isinstance(v, (int, float))}
+            )
+        logging.info(
+            "Training done. Run %s at %s/#/experiments/%s/runs/%s",
+            run.info.run_id,
+            config.mlflow_tracking_uri,
+            run.info.experiment_id,
+            run.info.run_id,
+        )
+
+    shutdown_distributed()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
