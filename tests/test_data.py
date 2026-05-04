@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import polars as pl
+
 from laser_detector.data import (
     DEFAULT_HEATMAP_SIGMA_PX,
     FrameRecord,
@@ -20,6 +22,7 @@ from laser_detector.data import (
     _chromaticity_norm,
     _make_gaussian_heatmap,
     _pick_crop_origin,
+    build_records,
 )
 
 
@@ -316,3 +319,56 @@ def test_hard_negative_sampler_record_index_to_array_index():
     assert ((chosen >= 3) & (chosen < 10)).all()
     # Without replacement → unique.
     assert len(set(chosen.tolist())) == 5
+
+
+def _frames_df(rows: list[dict]) -> pl.DataFrame:
+    return pl.DataFrame(rows, schema={
+        "image_id": pl.Int64, "dive_id": pl.Int64,
+        "image_path": pl.Utf8, "image_checksum": pl.Utf8,
+        "label_x": pl.Float64, "label_y": pl.Float64,
+        "is_positive": pl.Boolean, "superseded": pl.Boolean,
+    })
+
+
+def _wavelengths_df(rows: list[dict]) -> pl.DataFrame:
+    return pl.DataFrame(rows, schema={"dive_id": pl.Int64, "wavelength": pl.Utf8})
+
+
+def test_build_records_drops_superseded_by_default():
+    frames = _frames_df([
+        {"image_id": 1, "dive_id": 10, "image_path": "/a", "image_checksum": "x",
+         "label_x": 100.0, "label_y": 100.0, "is_positive": True, "superseded": False},
+        {"image_id": 2, "dive_id": 10, "image_path": "/b", "image_checksum": "y",
+         "label_x": 200.0, "label_y": 200.0, "is_positive": True, "superseded": True},
+    ])
+    wls = _wavelengths_df([{"dive_id": 10, "wavelength": "red"}])
+    records = build_records(frames, wls)
+    assert len(records) == 1
+    assert records[0].image_id == 1
+
+
+def test_build_records_keeps_superseded_when_flag_disabled():
+    frames = _frames_df([
+        {"image_id": 1, "dive_id": 10, "image_path": "/a", "image_checksum": "x",
+         "label_x": 100.0, "label_y": 100.0, "is_positive": True, "superseded": False},
+        {"image_id": 2, "dive_id": 10, "image_path": "/b", "image_checksum": "y",
+         "label_x": 200.0, "label_y": 200.0, "is_positive": True, "superseded": True},
+    ])
+    wls = _wavelengths_df([{"dive_id": 10, "wavelength": "red"}])
+    records = build_records(frames, wls, drop_superseded=False)
+    assert len(records) == 2
+
+
+def test_build_records_no_op_when_superseded_column_missing():
+    """Phase-0 parquets that predate the upstream supersession lack the column."""
+    frames = pl.DataFrame([
+        {"image_id": 1, "dive_id": 10, "image_path": "/a", "image_checksum": "x",
+         "label_x": 100.0, "label_y": 100.0, "is_positive": True},
+    ], schema={
+        "image_id": pl.Int64, "dive_id": pl.Int64,
+        "image_path": pl.Utf8, "image_checksum": pl.Utf8,
+        "label_x": pl.Float64, "label_y": pl.Float64, "is_positive": pl.Boolean,
+    })
+    wls = _wavelengths_df([{"dive_id": 10, "wavelength": "red"}])
+    records = build_records(frames, wls)  # drop_superseded=True default
+    assert len(records) == 1

@@ -150,6 +150,19 @@ def main(argv: list[str] | None = None) -> int:
     wavelengths = pl.read_parquet(config.data_dir / "dive_wavelengths.parquet")
     lines = pl.read_parquet(config.data_dir / "dive_lines.parquet")
 
+    # Drop upstream-superseded frames before *both* training and eval — those
+    # labels were flagged as outliers and would unfairly count against the
+    # model in the val/full-val pass. `build_records` does the same filter
+    # internally; we mirror it here so `evaluate()`'s frames-table is consistent.
+    if "superseded" in frames.columns:
+        n_before = frames.height
+        frames = frames.filter(~pl.col("superseded"))
+        if ddp.is_main and frames.height < n_before:
+            logging.info(
+                "Dropped %d superseded frames (kept %d / %d)",
+                n_before - frames.height, frames.height, n_before,
+            )
+
     train_records, train_dives, n_train = _split_records(
         frames=frames, splits=splits, wavelengths=wavelengths,
         split="train", max_dives=args.max_train_dives,

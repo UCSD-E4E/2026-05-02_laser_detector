@@ -69,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     splits = pl.read_parquet(config.data_dir / "dive_splits.parquet")
     wavelengths = pl.read_parquet(config.data_dir / "dive_wavelengths.parquet")
     lines = pl.read_parquet(config.data_dir / "dive_lines.parquet")
+    if "superseded" in frames.columns:
+        frames = frames.filter(~pl.col("superseded"))
 
     split_dive_ids = (
         splits.filter(pl.col("split") == args.split)["dive_id"].unique().to_list()

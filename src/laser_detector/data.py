@@ -399,8 +399,21 @@ class HardNegativeBalancedSampler:
 def build_records(
     frames: pl.DataFrame,
     wavelengths: pl.DataFrame,
+    *,
+    drop_superseded: bool = True,
 ) -> list[FrameRecord]:
-    """Join Phase 0 frames + wavelengths into the per-frame records the dataset uses."""
+    """Join Phase 0 frames + wavelengths into per-frame records.
+
+    `drop_superseded=True` (default) excludes frames whose label was superseded
+    upstream (typically because the labeler-error audit flagged the label as
+    an outlier). Training on superseded labels regresses the heatmap to known-
+    bad targets and contributes to the bimodal failure mode in the Phase 2
+    BCE+pos_weight run.
+
+    Set False for ablation runs that want to measure the impact of the filter.
+    """
+    if drop_superseded and "superseded" in frames.columns:
+        frames = frames.filter(~pl.col("superseded"))
     joined = frames.join(
         wavelengths.select("dive_id", "wavelength"), on="dive_id", how="left"
     )
