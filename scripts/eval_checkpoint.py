@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         splits.filter(pl.col("split") == args.split)["dive_id"].unique().to_list()
     )
     split_frames = frames.filter(pl.col("dive_id").is_in(split_dive_ids))
-    records = build_records(split_frames, wavelengths)
+    records = build_records(split_frames, wavelengths, lines)
     if ddp.is_main:
         logging.info(
             "Eval split=%s: %d dives, %d frames, ckpt=%s",

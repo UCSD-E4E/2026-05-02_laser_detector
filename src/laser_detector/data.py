@@ -158,6 +158,14 @@ class FrameRecord:
     image_checksum: str
     label_xy: tuple[float, float] | None  # None = negative frame
     wavelength: str | None  # "red" / "green" / None
+    # Per-dive line fit (DESIGN.md §3.1). The trio (a, b, c) parameterizes
+    # `a*x + b*y + c = 0` in frame coordinates, with (a, b) unit-normalized
+    # so |a*x + b*y + c| is the perpendicular distance directly. None for
+    # dives where Phase 0 couldn't fit a line (no positive labels). Used by
+    # the L_line aux loss (DESIGN §5.1) and inference soft-snap (§6.2).
+    line_abc: tuple[float, float, float] | None = None
+    line_confidence: float = 0.0
+    is_line_confident: bool = False
 
 
 class LaserTileDataset(Dataset):
@@ -269,12 +277,25 @@ class LaserTileDataset(Dataset):
             )
             presence = 1.0 if heatmap.max() > 0.0 else 0.0
 
+        # Line params for the L_line aux loss. Always emit a (3,) tensor; the
+        # trainer masks frames where line_abc is None or is_line_confident is
+        # False. Default abc=(0,0,1) is a degenerate "line" — won't be used
+        # because the valid_mask gates it out, but keeps tensor shapes stable.
+        if rec.line_abc is None:
+            line_abc = (0.0, 0.0, 1.0)
+        else:
+            line_abc = rec.line_abc
+
         return {
             "image": torch.from_numpy(x_chw),
             "heatmap": torch.from_numpy(heatmap).unsqueeze(0),
             "presence": torch.tensor(presence, dtype=torch.float32),
             "image_id": int(rec.image_id),
             "dive_id": int(rec.dive_id),
+            "crop_offset": torch.tensor([crop_x, crop_y], dtype=torch.float32),
+            "line_abc": torch.tensor(line_abc, dtype=torch.float32),
+            "line_confidence": torch.tensor(rec.line_confidence, dtype=torch.float32),
+            "is_line_confident": torch.tensor(rec.is_line_confident, dtype=torch.bool),
         }
 
 
@@ -399,10 +420,11 @@ class HardNegativeBalancedSampler:
 def build_records(
     frames: pl.DataFrame,
     wavelengths: pl.DataFrame,
+    lines: pl.DataFrame | None = None,
     *,
     drop_superseded: bool = True,
 ) -> list[FrameRecord]:
-    """Join Phase 0 frames + wavelengths into per-frame records.
+    """Join Phase 0 frames + wavelengths (+ optional lines) into per-frame records.
 
     `drop_superseded=True` (default) excludes frames whose label was superseded
     upstream (typically because the labeler-error audit flagged the label as
@@ -410,19 +432,39 @@ def build_records(
     bad targets and contributes to the bimodal failure mode in the Phase 2
     BCE+pos_weight run.
 
-    Set False for ablation runs that want to measure the impact of the filter.
+    `lines` (optional) attaches per-dive line params + confidence so the
+    trainer's L_line aux loss (DESIGN §5.1) and inference soft-snap (§6.2)
+    can read them off the FrameRecord without separate lookups.
+
+    Set drop_superseded=False for ablation runs that want to measure the
+    impact of the filter.
     """
     if drop_superseded and "superseded" in frames.columns:
         frames = frames.filter(~pl.col("superseded"))
     joined = frames.join(
         wavelengths.select("dive_id", "wavelength"), on="dive_id", how="left"
     )
+    if lines is not None:
+        joined = joined.join(
+            lines.select("dive_id", "line_a", "line_b", "line_c",
+                         "line_confidence", "is_line_confident"),
+            on="dive_id", how="left",
+        )
     records: list[FrameRecord] = []
     for row in joined.iter_rows(named=True):
         is_pos = bool(row["is_positive"])
         label_xy = (
             (float(row["label_x"]), float(row["label_y"])) if is_pos else None
         )
+        line_abc: tuple[float, float, float] | None = None
+        line_conf = 0.0
+        is_line_conf = False
+        if lines is not None and row.get("line_a") is not None:
+            line_abc = (
+                float(row["line_a"]), float(row["line_b"]), float(row["line_c"]),
+            )
+            line_conf = float(row.get("line_confidence") or 0.0)
+            is_line_conf = bool(row.get("is_line_confident") or False)
         records.append(
             FrameRecord(
                 image_id=int(row["image_id"]),
@@ -431,6 +473,9 @@ def build_records(
                 image_checksum=str(row["image_checksum"]),
                 label_xy=label_xy,
                 wavelength=row["wavelength"],
+                line_abc=line_abc,
+                line_confidence=line_conf,
+                is_line_confident=is_line_conf,
             )
         )
     return records

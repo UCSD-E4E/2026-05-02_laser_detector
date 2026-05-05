@@ -71,6 +71,55 @@ class LaserDetector(nn.Module):
         }
 
 
+def line_consistency_loss(
+    heatmap_logits: torch.Tensor,    # [B, 1, H, W]
+    crop_offsets: torch.Tensor,      # [B, 2] (crop_x, crop_y) in frame coords
+    line_abc: torch.Tensor,          # [B, 3] (a, b, c), with (a, b) unit-normalized
+    line_confidence: torch.Tensor,   # [B]
+    valid_mask: torch.Tensor,        # [B] bool — only these contribute to the loss
+    *,
+    softmax_temperature: float = 1.0,
+) -> torch.Tensor:
+    """Per DESIGN.md §5.1: penalize the perpendicular distance from the
+    predicted heatmap centroid (soft-argmax) to the dive's RANSAC line.
+
+    Soft-argmax across the (H, W) heatmap gives a differentiable (x, y).
+    Adding `crop_offsets` lifts that into frame coordinates so it can be
+    compared against the line, which is in frame coordinates too.
+
+    `valid_mask` should be True only for frames where (a) the dive's line is
+    confident, and (b) the per-tile presence target is 1 (the label is in
+    this crop). Computing soft-argmax on a near-zero heatmap gives a
+    near-uniform centroid that has no meaningful relationship to the line.
+
+    `line_abc` are normalized so `a^2 + b^2 = 1`; perpendicular distance
+    reduces to `|a*x + b*y + c|`. Returns mean perpendicular distance over
+    valid frames, scaled by line_confidence. Returns 0 if no frames are valid.
+    """
+    if not valid_mask.any():
+        return heatmap_logits.new_zeros(())
+
+    B, _, H, W = heatmap_logits.shape
+    # Soft-argmax: softmax over the (H*W) flattened spatial map; expectation
+    # of x and y under that distribution gives a differentiable centroid.
+    flat = (heatmap_logits.view(B, -1) / softmax_temperature)
+    soft = torch.softmax(flat, dim=1).view(B, H, W)
+    xs = torch.arange(W, device=heatmap_logits.device, dtype=soft.dtype)
+    ys = torch.arange(H, device=heatmap_logits.device, dtype=soft.dtype)
+    pred_x_local = (soft.sum(dim=1) * xs).sum(dim=1)  # [B]
+    pred_y_local = (soft.sum(dim=2) * ys).sum(dim=1)  # [B]
+
+    pred_x = pred_x_local + crop_offsets[:, 0]
+    pred_y = pred_y_local + crop_offsets[:, 1]
+
+    a, b, c = line_abc[:, 0], line_abc[:, 1], line_abc[:, 2]
+    perp_dist = (a * pred_x + b * pred_y + c).abs()  # [B] frame px
+
+    weight = (line_confidence * valid_mask.float()).clamp(min=0.0)
+    n_valid_weight = weight.sum().clamp(min=1.0)
+    return (perp_dist * weight).sum() / n_valid_weight
+
+
 def bce_heatmap_loss(
     pred_logits: torch.Tensor,
     target: torch.Tensor,

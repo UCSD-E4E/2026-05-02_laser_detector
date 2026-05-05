@@ -114,6 +114,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "0 disables. Recommended ≥10 for 50-epoch runs (subsample variance).",
     )
     parser.add_argument(
+        "--lambda-line",
+        type=float,
+        default=0.0,
+        help="Weight for the L_line aux loss (DESIGN.md §5.1). 0 disables; "
+        "Phase 3 default per DESIGN is 0.1. Active only on tiles where the "
+        "dive's line is confident AND the label is in the crop.",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -128,6 +136,7 @@ def _split_records(
     frames: pl.DataFrame,
     splits: pl.DataFrame,
     wavelengths: pl.DataFrame,
+    lines: pl.DataFrame | None,
     split: str,
     max_dives: int,
 ):
@@ -137,7 +146,7 @@ def _split_records(
     if max_dives > 0:
         dive_ids = dive_ids[:max_dives]
     split_frames = frames.filter(pl.col("dive_id").is_in(dive_ids))
-    return build_records(split_frames, wavelengths), dive_ids, split_frames.height
+    return build_records(split_frames, wavelengths, lines), dive_ids, split_frames.height
 
 
 def _filter_loadable(
@@ -201,11 +210,11 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     train_records, train_dives, n_train = _split_records(
-        frames=frames, splits=splits, wavelengths=wavelengths,
+        frames=frames, splits=splits, wavelengths=wavelengths, lines=lines,
         split="train", max_dives=args.max_train_dives,
     )
     val_records, val_dives, n_val = _split_records(
-        frames=frames, splits=splits, wavelengths=wavelengths,
+        frames=frames, splits=splits, wavelengths=wavelengths, lines=lines,
         split="val", max_dives=args.max_val_dives,
     )
     train_records, n_train_dropped = _filter_loadable(train_records, image_loader)
@@ -234,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         heatmap_loss=args.heatmap_loss,
         heatmap_pos_weight=args.heatmap_pos_weight,
         early_stop_patience=args.early_stop_patience,
+        lambda_line=args.lambda_line,
     )
 
     resume_from: Path | None = None

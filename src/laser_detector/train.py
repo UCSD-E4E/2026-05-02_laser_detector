@@ -35,7 +35,12 @@ from laser_detector.data import (
 )
 from laser_detector.eval import PREDICTION_TABLE_SCHEMA, evaluate
 from laser_detector.inference import predict_frame
-from laser_detector.model import LaserDetector, bce_heatmap_loss, focal_heatmap_loss
+from laser_detector.model import (
+    LaserDetector,
+    bce_heatmap_loss,
+    focal_heatmap_loss,
+    line_consistency_loss,
+)
 from laser_detector.preprocessing.image_loader import ImageLoader
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,11 @@ class TrainConfig:
     prefetch_factor: int = 2
     lambda_heatmap: float = 1.0
     lambda_presence: float = 0.5
+    # DESIGN.md §5.1 L_line aux loss (Phase 3). 0 disables it. Active only on
+    # tiles where (a) the dive's line is confident, AND (b) the per-tile
+    # presence target is 1 — i.e. the label landed in the crop, so the
+    # heatmap soft-argmax has a meaningful relationship to the line.
+    lambda_line: float = 0.0
     presence_threshold: float = 0.5
     # Heatmap loss formulation. CenterNet's focal loss collapses on this corpus
     # (1-pixel target in 1M-pixel tile → degenerate "predict 0 everywhere"
@@ -281,7 +291,7 @@ def _train_one_epoch(
 ) -> tuple[dict[str, float], int]:
     model.train()
     autocast_dtype = torch.bfloat16 if cfg.use_bf16 and device.type == "cuda" else None
-    sums = {"loss": 0.0, "loss_heatmap": 0.0, "loss_presence": 0.0}
+    sums = {"loss": 0.0, "loss_heatmap": 0.0, "loss_presence": 0.0, "loss_line": 0.0}
     n_batches = 0
     global_step = int(global_step_start)
 
@@ -319,7 +329,24 @@ def _train_one_epoch(
         loss_pres = torch.nn.functional.binary_cross_entropy_with_logits(
             presence_logits, presence_target
         )
-        loss = cfg.lambda_heatmap * loss_hm + cfg.lambda_presence * loss_pres
+        if cfg.lambda_line > 0.0:
+            crop_offset = batch["crop_offset"].to(device, non_blocking=True)
+            line_abc_t = batch["line_abc"].to(device, non_blocking=True)
+            line_conf_t = batch["line_confidence"].to(device, non_blocking=True)
+            is_line_conf_t = batch["is_line_confident"].to(device, non_blocking=True)
+            # Only frames whose dive has a confident line AND whose label is in
+            # the crop contribute. The presence target == 1 ↔ label-in-crop.
+            valid_mask = is_line_conf_t & (presence_target > 0.5)
+            loss_line = line_consistency_loss(
+                heatmap_logits, crop_offset, line_abc_t, line_conf_t, valid_mask,
+            )
+        else:
+            loss_line = heatmap_logits.new_zeros(())
+        loss = (
+            cfg.lambda_heatmap * loss_hm
+            + cfg.lambda_presence * loss_pres
+            + cfg.lambda_line * loss_line
+        )
 
         loss.backward()
         optimizer.step()
@@ -328,9 +355,11 @@ def _train_one_epoch(
         loss_val = float(loss.item())
         loss_hm_val = float(loss_hm.item())
         loss_pres_val = float(loss_pres.item())
+        loss_line_val = float(loss_line.item())
         sums["loss"] += loss_val
         sums["loss_heatmap"] += loss_hm_val
         sums["loss_presence"] += loss_pres_val
+        sums["loss_line"] += loss_line_val
         n_batches += 1
         global_step += 1
         if pbar is not None and n_batches % 20 == 0:
@@ -338,8 +367,6 @@ def _train_one_epoch(
                 loss=f"{sums['loss'] / n_batches:.4f}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
-        # Per-step metrics for the loss curve. Rank-0 only (avoids 4× duplicate
-        # log entries) and only every N steps to keep MLflow API traffic sane.
         if (
             step_callback is not None
             and ddp.is_main
@@ -350,6 +377,7 @@ def _train_one_epoch(
                 "step_loss": loss_val,
                 "step_loss_heatmap": loss_hm_val,
                 "step_loss_presence": loss_pres_val,
+                "step_loss_line": loss_line_val,
                 "lr": float(scheduler.get_last_lr()[0]),
             })
 
@@ -357,11 +385,14 @@ def _train_one_epoch(
     # Average across ranks so the logged number reflects global behavior, not
     # rank 0's slice. Each rank saw a different subset of batches.
     if ddp.is_distributed:
-        t = torch.tensor([means["loss"], means["loss_heatmap"], means["loss_presence"]],
-                         device=ddp.device)
+        t = torch.tensor(
+            [means["loss"], means["loss_heatmap"], means["loss_presence"], means["loss_line"]],
+            device=ddp.device,
+        )
         dist.all_reduce(t, op=dist.ReduceOp.AVG)
-        means["loss"], means["loss_heatmap"], means["loss_presence"] = (
-            float(t[0]), float(t[1]), float(t[2]),
+        (means["loss"], means["loss_heatmap"],
+         means["loss_presence"], means["loss_line"]) = (
+            float(t[0]), float(t[1]), float(t[2]), float(t[3]),
         )
     return means, global_step
 
