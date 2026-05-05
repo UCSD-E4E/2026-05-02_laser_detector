@@ -177,11 +177,11 @@ Sub-pixel offset head: **not used.** "Anywhere within the laser is good enough" 
 L = λ_hm * L_heatmap + λ_pres * L_presence + λ_line * L_line
 ```
 
-- **`L_heatmap`** (focal heatmap loss, à la CenterNet): applied only on positive frames. Penalizes the predicted heatmap against the Gaussian target. Focal weighting handles the severe positive-pixel imbalance (one Gaussian blob in a 512×512 frame).
-- **`L_presence`** (BCE): applied on all frames, with hard-negative mining — sample 50/50 from positives and from "hard" negatives (negatives with high heatmap response in the previous epoch). Random sampling is dominated by trivial negatives and produces a useless presence head.
-- **`L_line`** (line-consistency aux loss): for positive frames in dives with `line_confidence > τ_line`, penalize the perpendicular distance from the predicted heatmap centroid (soft-argmax) to the dive's line. Weighted by `line_confidence`. Skipped for line-ambiguous dives.
+- **`L_heatmap`** (BCE with `pos_weight`, **not** focal): applied to every tile against the Gaussian target. The Phase-2 implementation tried CenterNet-style penalty-reduced focal loss first and observed a hard collapse to the trivial "predict 0 everywhere" minimum at any LR — `(p^α) · log(1-p)` summed over ~1M near-zero target pixels per tile dwarfs the 1-positive-pixel reward, and `(1-target)^β` doesn't soften it enough at σ=3 over a 1024² tile. BCE with `pos_weight ≈ 1000` (set as 30× the actual ~30:1M active-pixel ratio) inverts the imbalance arithmetically and converges cleanly on the same data. Focal is kept in code as `model.focal_heatmap_loss` for ablation but is not the default. Loss is computed in fp32 even under bf16 autocast — bf16's 7-bit mantissa is too coarse for the log-of-clamped-sigmoid; this is a silent regression risk if anyone moves the loss back inside the autocast block.
+- **`L_presence`** (BCE): applied on all frames, with hard-negative mining — sample 50/50 from positives and from "hard" negatives (negatives with high heatmap response in the previous epoch). Random sampling is dominated by trivial negatives and produces a useless presence head. Especially load-bearing for this corpus: only ~5% of frames are negatives, so uniform shuffling barely shows the presence head any negative class. Implemented as `data.HardNegativeBalancedSampler` with rank-aware sharding under DDP; rank 0 owns the score-update RNG and broadcasts updated `neg_scores` after each epoch so all ranks shuffle consistently.
+- **`L_line`** (line-consistency aux loss): for positive frames in dives with `line_confidence > τ_line`, penalize the perpendicular distance from the predicted heatmap centroid (soft-argmax) to the dive's line. Weighted by `line_confidence`. Skipped for line-ambiguous dives. **Phase 3** — not yet wired.
 
-Default weights: `λ_hm = 1.0`, `λ_pres = 0.5`, `λ_line = 0.1`. Tuned via MLflow sweep.
+Default weights: `λ_hm = 1.0`, `λ_pres = 0.5`, `λ_line = 0.1` (Phase 3+). Tuned via MLflow sweep in Phase 4.
 
 ### 5.2 Augmentation
 
@@ -197,12 +197,19 @@ Geometric (off by default):
 ### 5.3 Optimizer
 
 - AdamW, LR `3e-4`, cosine decay
-- Batch size: as large as fits on the GPU (target 16+)
-- Mixed precision (bf16 if supported, else fp16)
-- Epochs: ~50, with early stopping on val hit-rate
-- Warmup: 1 epoch linear
+- Batch size: `--batch-size` is **per-rank** under torchrun. Phase 2 uses bs=16/rank × 4 ranks = global bs=64 on 4× RTX 4500 Ada (24 GB each, ~16 GB used at this config — bs=20–24/rank is feasible if needed).
+- Mixed precision: bf16 forward (`torch.autocast`), losses in fp32 (cast `.float()` before computing — see §5.1).
+- Epochs: ~50, with early stopping on val hit-rate. **Early stopping not yet wired**; current 10-epoch runs overshoot the localization peak and rely on best-checkpoint selection.
+- Warmup: **1000 absolute steps** (was "1 epoch linear" before Phase 2 — at full-corpus 4272 batches/epoch a 1-epoch warmup leaves LR sub-1e-5 for ~10% of training and the model never escapes init). The CLI flag `--warmup-steps` overrides `warmup_epochs`.
+- Distributed training: `torchrun --standalone --nproc_per_node=4` for 4-GPU DDP. Rank 0 owns checkpoint saves, MLflow logging, final-val, and latency benchmark. Val inference shards across all ranks and gathers to rank 0.
 
-### 5.4 Inference-prior independence
+### 5.4 Per-epoch evaluation strategy
+
+Per-epoch full-val on 4309 frames at ~1 s/frame = ~72 min/epoch is unworkable across 10+ epochs. Each epoch's `[best]` selection runs on a **stratified 200-frame subsample** (positive/negative ratio preserved); a single full-val pass at end-of-training produces the canonical metrics under `final_val_*`. The subsample is fixed across epochs (deterministic seed) so per-epoch trajectories are comparable.
+
+Subsample variance is high — at 3-pixel tolerance with ~190 positives, a single run's hit_rate can swing ±0.10 between epochs purely from sampling noise. The "best by subsample" checkpoint has empirically agreed with "best by full-val" in Phase 2 runs, but this should be verified by re-evaluating the selected checkpoint on the full val split (`scripts/eval_checkpoint.py`).
+
+### 5.5 Inference-prior independence
 
 The model takes **only image + wavelength**. The line prior never enters the model directly — it only appears as auxiliary supervision and as optional post-processing (§6.2). This keeps the model usable on new dives where no line is available yet.
 
@@ -306,11 +313,18 @@ Per training run, log:
 - Data version / commit / row count
 - Split seed and dive-level split manifest hash
 
-**Metrics** (per epoch):
-- Train and val: total loss, heatmap loss, presence loss, line loss
-- Val: hit rate (blob-tolerance and fixed-tolerance N=3, N=4), mean pixel error, presence AUROC, FPR@τ
-- Sliced val metrics by wavelength
-- **Inference latency**: ms/frame on the training GPU at batch=1 and batch=8. Tracked from Phase 2 onward so we have a record well before the UUV port; a regression here is a real signal.
+**Metrics** (per epoch, stepped by epoch index):
+- Train: `train_loss`, `train_loss_heatmap`, `train_loss_presence`, (Phase 3+) `train_loss_line`
+- Val: `val_hit_rate_n3`, `val_hit_rate_n4`, `val_mean_pixel_error`, `val_presence_auroc`, `val_fpr_at_threshold`, `val_recall_at_threshold`
+- Sliced val metrics by wavelength (`wavelength_<wl>/...`) and by line-confidence quartile (`line_q<1-4>/...`)
+- Hard-negative scoring overhead: `hard_negative_score_seconds`, `hard_negative_score_n`
+
+**Metrics** (per training step, stepped by global batch index, every `log_every_n_steps` batches — default 50):
+- `step_loss`, `step_loss_heatmap`, `step_loss_presence`, `lr`. Gives a smooth loss curve in the MLflow UI; per-epoch series alone is too coarse (~10 points) to be useful for debugging.
+
+**Metrics** (per run, logged once at end):
+- `final_val_*`: full-val pass on all val frames after training, the canonical eval (per-epoch uses a 200-frame subsample for speed).
+- `latency_bs1_ms`, `latency_bs8_ms`: ms/frame at 4K full-tile-grid on rank 0's GPU. Tracked from Phase 2 onward so we have a record well before the UUV port; a regression here is a real signal.
 
 **Artifacts**:
 - Best checkpoint
@@ -338,41 +352,50 @@ Register the deployed model under a name like `fishsense-laser-detector`. Stages
 
 Each phase ends with metrics logged to MLflow and a go/no-go before moving on.
 
-### Phase 0 — Data & preprocessing (no model)
+### Phase 0 — Data & preprocessing (no model) ✓ done
 
-- Pull labels via fishsense-sdk; build the frame-level table with `rig_id` tagged.
-- Implement per-dive RANSAC line fit and confidence.
-- Implement per-dive wavelength clustering.
-- **Laser-size audit**: for a sample of positive frames at 4K native, segment the laser blob locally and compute its pixel-diameter distribution. Confirms the 3–8 px assumption and informs σ choice for the heatmap target.
-- Build dive-level splits, stratified by wavelength.
-- **Deliverable**: cleaned dataset + per-dive metadata + blob-size distribution, all in MLflow.
-- **Decision point**: confirm line-fit confidence distribution looks sane; confirm wavelength clusters are clean; confirm blob-size assumption holds.
+- ~~Pull labels via fishsense-sdk; build the frame-level table with `rig_id` tagged.~~ Done.
+- ~~Per-dive RANSAC line fit and confidence~~ — done. Output: `dive_lines.parquet` with `line_confidence`, `is_line_confident` per dive.
+- ~~Per-dive wavelength clustering~~ — done. 99% of dives resolve via `label_string` (the SDK label name carries the color word); the `dive_color` clustering fallback exists but rarely fires.
+- ~~Laser-size audit~~ — done. Confirmed: median 8.6 px diameter; red blobs ~2× green (median 11 vs 5.6). σ=3 is a compromise; wavelength-conditional σ is a Phase 4 sweep candidate.
+- ~~Dive-level splits~~ — done, stratified by wavelength.
+- **Re-run cadence**: each Phase 0 re-run picks up upstream label changes (e.g., outlier supersession). Image cache (~331 GB) hits by checksum, so re-runs are ~20 s once warm. `scripts/run_phase0.py --force` recomputes every step.
 
-### Phase 1 — Classical CV baseline
+### Phase 1 — Classical CV baseline ✓ done
 
-- Per dive: compute a wavelength-specific color mask, find the brightest blob, score by closeness to the dive's line.
-- No learning. This is the floor.
-- **Deliverable**: hit rate / FPR baseline numbers in MLflow.
-- **Decision point**: how much headroom does the learned model need to provide?
+- ~~Wavelength-specific color mask, brightest blob, scored by line proximity~~ — done.
+- Run via `scripts/run_baseline.py --split val/test`. Logs to MLflow with tag `phase1_baseline`.
+- Establishes the floor a learned model has to beat.
 
-### Phase 2 — Supervised heatmap detector
+### Phase 2 — Supervised heatmap detector ⏳ in progress
 
-- ResNet-34 U-Net, heatmap + presence head, no line aux loss yet.
-- Train, evaluate, log.
-- **Deliverable**: first learned-model metrics.
-- **Decision point**: where does it fail? Slicing tells us whether to add the line aux loss next or focus on color robustness.
+- ResNet-34 U-Net + per-tile presence head, no line aux loss yet.
+- DDP training across 4 GPUs (`torchrun --nproc_per_node=4 scripts/run_train.py`).
+- 4-channel input: chromaticity-normalized RGB + wavelength channel.
+- **Loss formulation iteration:** focal collapsed → BCE+pos_weight=1000 escapes (see §5.1).
+- **First production result (10 epochs, 2026-05-04, cleaned data):** epoch-2 best on subsample, full-val on best-checkpoint TBD; at the time of writing trending toward hit_rate_n3 ≈ 0.35, hit_rate_n4 ≈ 0.55, AUROC ≈ 0.91, FPR@0.5 ≈ 0.15. Latency ~950 ms/frame at 4K full-tile-grid (15 tiles, batch=1 or batch=8 — compute-bound on this GPU).
+- **Observed failure mode** to address in Phase 3: bimodal — when the heatmap argmax hits, it hits within 4 px on >50% of frames; when it misses, mean error is 200+ px (argmax wandered into the wrong tile). Soft-snap-to-line is the targeted fix.
 
-### Phase 3 — Add line aux loss + line post-refinement
+### Phase 3 — Add line aux loss + line post-refinement (next)
 
-- Add `L_line`, evaluate impact.
-- Add inference-time soft-snap to line, evaluate impact.
+- Add `L_line`, evaluate impact on hit_rate (especially on the tail of catastrophic misses).
+- Add inference-time soft-snap to line. The 200+ px misses in Phase 2 are exactly the failure mode this targets.
+- Wire **early stopping on val hit-rate** before the run (DESIGN said this in §5.3 but Phase 2 didn't have it).
+- Wire **resume from checkpoint** before any 50-epoch+ run.
 - **Decision point**: does the prior help, especially on hard slices? If not, drop it — complexity isn't free.
 
 ### Phase 4 — Hardening & registry promotion
 
-- Hyperparameter sweep (loss weights, sigma, presence threshold).
-- Failure audit on worst dives; iterate on data quality if a few dives dominate the loss.
+- Hyperparameter sweep (`pos_weight`, `σ` per wavelength, `λ_hm`/`λ_pres`/`λ_line`, presence threshold).
+- Failure audit on worst dives (per DESIGN §7.3) — iterate on data quality if a few dives dominate the loss.
+- Sub-pixel argmax (parabolic peak refinement) at inference — cheap, may close 1–2 px of the gap.
 - Promote best run to `Production` in the model registry.
+
+### Phase 5 (revisit if accuracy gap remains) — Two-stage cascade
+
+- If Phase 4 stalls below 95%, switch to: presence head finds candidate tiles → focused 256² high-res heatmap on candidates only. Reduces pos:neg pixel ratio from 1:1M to 1:65k.
+- Or swap ResNet-34 backbone for HRNet-W18 (higher-resolution branches throughout).
+- Both are documented in §4.2 as deferred until accuracy data justifies them. Phase 2's bimodal failure is an *argmax-localization* failure, not a *pos:neg-imbalance* failure, so Phase 3 (line prior) should be tried first.
 
 ---
 
@@ -381,22 +404,33 @@ Each phase ends with metrics logged to MLflow and a go/no-go before moving on.
 ### Risks
 
 - **Tiny target**: the laser is 3–8 px across. This is the dominant risk and the reason input resolution gets its own subsection (§4.1). If full-frame-high-res training doesn't fit the GPU, fall back to tiled inference. Don't paper over this with interpolation tricks — the model needs to see real laser pixels.
-- **Label noise**: 60k labels are not all equal. The colinearity check catches gross outliers but not within-line errors. May need spot human re-labeling on low-performing dives.
-- **Small object + class imbalance**: the standard pitfall for keypoint detection. Focal heatmap loss + hard-negative mining are the standard mitigations; if they're insufficient, consider higher input resolution or two-stage cascade (revisit).
+- **Label noise**: 60k labels are not all equal. **Mitigated upstream**: the labeling team marks outlier labels with `superseded=True` and they're filtered server-side before reaching us; the corpus dropped 28% (43834 → 31469 positives) between 2026-05-03 and 2026-05-04 as a result. `build_records()` and the entry-point scripts also filter `superseded=True` defensively in case the SDK behavior changes. Within-line label noise still exists but is much smaller.
+- **Small object + class imbalance**: the standard pitfall for keypoint detection. The CenterNet penalty-reduced focal loss collapses on this corpus regardless of LR (the 1-positive-pixel-out-of-1M imbalance has the trivial solution at `pred=0` everywhere as a stable global minimum). **Mitigation**: BCE with `pos_weight ≈ 1000` (see §5.1) escapes cleanly. Hard-negative mining (5% negative rate makes random sampling useless) is in `data.HardNegativeBalancedSampler`. If those still aren't enough, two-stage cascade (Phase 5).
+- **Subsample variance for checkpoint selection**: 200-frame per-epoch val subsample has ±0.10 hit_rate variance at strict 3-px tolerance. Subsample picks the right "best" epoch in practice but the absolute number is noisy. Final full-val + per-checkpoint full-val on `best_epoch.pt` close the loop.
 - **Cold-start performance**: new dives don't have a line or wavelength tag. Bootstrap procedure should work but is untested. May need to instrument production for graceful degradation.
 - **Distribution shift between dives**: water clarity, depth, fish density vary widely. Augmentation is the first defense; if it isn't enough, per-dive batch-norm calibration or test-time adaptation is a fallback.
 - **Future rig changes**: when new rigs arrive, the per-rig prior assumption breaks. Mitigation: `rig_id` tagged from Phase 0 so we can train per-rig models without re-touching the dataset. Single unified cross-rig model is explicitly out of scope.
-- **UUV deployment gap**: the model trained on a server GPU has to eventually run at 20 fps on edge. We instrument latency from Phase 2 to keep the gap honest, but real port effort is deferred. Avoiding exotic backbone ops is the cheap insurance we're paying now.
+- **UUV deployment gap**: the model trained on a server GPU has to eventually run at 20 fps on edge. We instrument latency from Phase 2 to keep the gap honest, but real port effort is deferred. Avoiding exotic backbone ops is the cheap insurance we're paying now. Current per-frame latency on RTX 4500 Ada at 4K with 15 tiles: ~950 ms (compute-bound; bs=1 ≈ bs=8). UUV target is 50 ms/frame; 19× gap to close — Phase 5 cascade alone can plausibly cut tile count from 15 to ~3, and TensorRT INT8 typically yields 2–4× more.
+- **Disk/I/O pressure during training**: at 4 ranks × 6 dataloader workers × prefetch=2 the random-access pattern on a 331 GB image cache can saturate NVMe even when most pages are RAM-cached, contending with other server processes. Phase 2 production runs use 4 ranks × 4 workers × prefetch=2 as a stable middle ground. Bumping further is fine in isolation but should be coordinated with anything else doing heavy disk on the host.
 
 ### Open questions
 
-All design-shaping open questions resolved as of 2026-05-02. Remaining operational unknown:
+Operational items still in motion:
 
-- **MLflow server URL / auth**. User is putting this together. Needed before Phase 2 logging starts; doesn't block Phase 0.
+- **NAS-path issues** for some dives (notably 219, 249) — frames are missing on disk; pre-warm currently flags them and the trainer drops them. Investigation upstream is in progress.
+- **Resume-from-checkpoint** is required for any run > 10 epochs and isn't wired yet. Blocking before the next 50-epoch run.
+- **Early stopping on val hit-rate** — stated in §5.3, not yet wired. Will land alongside resume.
 
 Resolved on 2026-05-02:
 - Native resolution: **4K**. Drives the tiling strategy in §4.1.
 - Per-frame depth / object-distance metadata: **not available**. Removed from auxiliary-task consideration.
 - Eventual deployment: **20 fps on UUV**, video. Captured in §1.
-- Mixed-color frames: **none** — single color per dive.
+- Mixed-color frames: **none** — single color per dive (overstated; ~42% of dives have a minority-color label, resolved by majority-vote per §3.2).
 - Rigs: similar in current data; future rigs get separate models.
+
+Resolved during Phase 2 (2026-05-03 → 2026-05-04):
+- **MLflow server**: live at `https://mlflow.krg.ucsd.edu`, basic-auth via the `mlflow-oidc-auth` plugin. Per-step + per-epoch metrics both flowing.
+- **Heatmap loss**: BCE with `pos_weight=1000`, not focal — see §5.1.
+- **Warmup**: 1000 absolute steps, not 1 epoch — see §5.3.
+- **Checkpoint selection**: best by subsample hit_rate during the run, then full-val on the chosen checkpoint via `scripts/eval_checkpoint.py` for the canonical number.
+- **Outlier labels**: filtered upstream via `superseded=True`. Defensive filter in `build_records()` and entry-point scripts.
