@@ -120,6 +120,23 @@ def _split_records(
     return build_records(split_frames, wavelengths), dive_ids, split_frames.height
 
 
+def _filter_loadable(
+    records: list,
+    image_loader: CachingImageLoader,
+) -> tuple[list, int]:
+    """Drop records whose JPEG cache file is missing.
+
+    The 230 prewarm-failed frames in the 2026-05-04 corpus (NAS-path issues
+    on dives 237/219/249) are clustered in record order; the dataset's
+    8-consecutive-failure retry budget can be exhausted by a single block of
+    them, crashing training at a random epoch. Filtering up-front is faster,
+    more deterministic, and free of restart cost.
+    """
+    n_before = len(records)
+    keep = [r for r in records if image_loader.cache_path(r.image_checksum).exists()]
+    return keep, n_before - len(keep)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     ddp = init_distributed()
@@ -171,10 +188,13 @@ def main(argv: list[str] | None = None) -> int:
         frames=frames, splits=splits, wavelengths=wavelengths,
         split="val", max_dives=args.max_val_dives,
     )
+    train_records, n_train_dropped = _filter_loadable(train_records, image_loader)
+    val_records, n_val_dropped = _filter_loadable(val_records, image_loader)
     if ddp.is_main:
         logging.info(
-            "Train: %d dives, %d frames | Val: %d dives, %d frames",
-            len(train_dives), n_train, len(val_dives), n_val,
+            "Train: %d dives, %d frames (dropped %d unloadable) | Val: %d dives, %d frames (dropped %d unloadable)",
+            len(train_dives), len(train_records), n_train_dropped,
+            len(val_dives), len(val_records), n_val_dropped,
         )
 
     # When --max-*-dives caps the records, restrict the splits frame the
