@@ -39,7 +39,13 @@ from laser_detector.preprocessing.image_loader import (
     LocalFilesystemImageLoader,
 )
 from laser_detector.tracking import setup_mlflow
-from laser_detector.train import TrainConfig, init_distributed, shutdown_distributed, train
+from laser_detector.train import (
+    TrainConfig,
+    find_latest_checkpoint,
+    init_distributed,
+    shutdown_distributed,
+    train,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -99,6 +105,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1000.0,
         help="pos_weight for BCE heatmap loss. Counterweights the "
         "1-pos-pixel-vs-1M-neg-pixel imbalance per tile.",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Stop after this many epochs without val hit_rate_n3 improvement. "
+        "0 disables. Recommended ≥10 for 50-epoch runs (subsample variance).",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Resume training from a checkpoint. Path to a .pt file, or 'auto' "
+        "to pick the highest-numbered epoch_NNN.pt in --checkpoint-dir.",
     )
     return parser.parse_args(argv)
 
@@ -213,7 +233,25 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         heatmap_loss=args.heatmap_loss,
         heatmap_pos_weight=args.heatmap_pos_weight,
+        early_stop_patience=args.early_stop_patience,
     )
+
+    resume_from: Path | None = None
+    if args.resume:
+        if args.resume == "auto":
+            resume_from = find_latest_checkpoint(args.checkpoint_dir)
+            if resume_from is None and ddp.is_main:
+                logging.info(
+                    "--resume auto: no checkpoint found in %s; starting from scratch",
+                    args.checkpoint_dir,
+                )
+        else:
+            resume_from = Path(args.resume)
+            if not resume_from.exists():
+                if ddp.is_main:
+                    logging.error("--resume path does not exist: %s", resume_from)
+                shutdown_distributed()
+                return 2
 
     if args.no_mlflow:
         train(
@@ -224,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             ddp=ddp,
+            resume_from=resume_from,
         )
         shutdown_distributed()
         return 0
@@ -240,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             ddp=ddp,
+            resume_from=resume_from,
         )
         shutdown_distributed()
         return 0
@@ -284,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
             epoch_callback=_on_epoch,
             step_callback=_on_step,
             ddp=ddp,
+            resume_from=resume_from,
         )
 
         if artifacts.best_checkpoint_path is not None:

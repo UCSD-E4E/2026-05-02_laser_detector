@@ -86,6 +86,10 @@ class TrainConfig:
     # as a smooth loss curve in MLflow / TensorBoard. Per-epoch metrics are
     # logged separately via epoch_callback.
     log_every_n_steps: int = 50
+    # Early stopping: number of epochs of no `hit_rate_n3` improvement before
+    # bailing. 0 disables; the recommended default for 50-epoch runs is ~10
+    # given subsample variance can make 3-4-epoch dips look real.
+    early_stop_patience: int = 0
 
 
 @dataclass
@@ -145,6 +149,111 @@ def init_distributed() -> DDPContext:
 def shutdown_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+def find_latest_checkpoint(checkpoint_dir: Path) -> Path | None:
+    """Return `epoch_NNN.pt` with the highest NNN, or None if none exist.
+
+    Phase 2 saves checkpoints as `epoch_{epoch:03d}.pt`; this gives us a
+    deterministic "latest" for `--resume auto` without needing a separate
+    pointer file."""
+    if not checkpoint_dir.exists():
+        return None
+    candidates = sorted(checkpoint_dir.glob("epoch_*.pt"))
+    return candidates[-1] if candidates else None
+
+
+def _save_checkpoint(
+    *,
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    sampler: HardNegativeBalancedSampler,
+    epoch: int,
+    global_step: int,
+    best_score: float,
+    best_epoch: int,
+    patience_counter: int,
+    metrics: dict[str, float],
+    cfg: TrainConfig,
+) -> None:
+    """Save full training state for resume.
+
+    Captured: model + optimizer + scheduler + sampler weights + RNG state +
+    early-stopping counters + per-epoch metrics + the cfg used for this run.
+    `model.module.state_dict()` if the model is DDP-wrapped — saving the
+    wrapper would make the checkpoint load-only-under-DDP, which breaks
+    `eval_checkpoint.py` and any future single-GPU resume.
+    """
+    # CUDA RNG state intentionally not saved: with DDP, each rank should
+    # evolve its own GPU RNG independently, and saving rank-0's view +
+    # restoring it on every rank would destroy that. Torch CPU RNG + numpy
+    # RNG cover the correctness-critical determinism (sampler, augmentations).
+    underlying = model.module if isinstance(model, DistributedDataParallel) else model
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_score": best_score,
+            "best_epoch": best_epoch,
+            "patience_counter": patience_counter,
+            "model_state_dict": underlying.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "sampler_state": {
+                "neg_scores": sampler.neg_scores,
+                "epoch": sampler._epoch,
+                "score_rng_state": sampler._score_rng.bit_generator.state,
+            },
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+            "metrics": metrics,
+            "cfg": cfg.__dict__,
+        },
+        path,
+    )
+
+
+def _load_checkpoint_for_resume(
+    *,
+    ckpt_path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    sampler: HardNegativeBalancedSampler,
+    device: torch.device,
+) -> dict:
+    """Restore everything `_save_checkpoint` wrote. Returns a dict with the
+    counters the trainer needs (`start_epoch`, `global_step`, `best_score`,
+    `best_epoch`, `patience_counter`)."""
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    underlying = model.module if isinstance(model, DistributedDataParallel) else model
+    underlying.load_state_dict(ckpt["model_state_dict"])
+
+    if "optimizer_state_dict" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+    if "sampler_state" in ckpt:
+        s = ckpt["sampler_state"]
+        sampler.neg_scores = np.asarray(s["neg_scores"], dtype=np.float64)
+        sampler._epoch = int(s["epoch"])
+        sampler._score_rng.bit_generator.state = s["score_rng_state"]
+
+    if "torch_rng_state" in ckpt:
+        torch.set_rng_state(ckpt["torch_rng_state"].cpu())
+    if "numpy_rng_state" in ckpt:
+        np.random.set_state(ckpt["numpy_rng_state"])
+
+    return {
+        "start_epoch": int(ckpt["epoch"]) + 1,
+        "global_step": int(ckpt.get("global_step", 0)),
+        "best_score": float(ckpt.get("best_score", -float("inf"))),
+        "best_epoch": int(ckpt.get("best_epoch", -1)),
+        "patience_counter": int(ckpt.get("patience_counter", 0)),
+    }
 
 
 def _cosine_with_warmup(optimizer, *, total_steps: int, warmup_steps: int):
@@ -511,6 +620,7 @@ def train(
     epoch_callback=None,
     step_callback=None,
     ddp: DDPContext | None = None,
+    resume_from: Path | None = None,
 ) -> TrainArtifacts:
     """Train the Phase 2 model. Caller is responsible for MLflow setup +
     forwarding `epoch_callback(epoch, metrics, checkpoint_path)` to log per-epoch.
@@ -591,6 +701,33 @@ def train(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     artifacts = TrainArtifacts()
     best_score = -float("inf")
+    start_epoch = 0
+    global_step = 0
+    patience_counter = 0
+
+    if resume_from is not None:
+        if ddp.is_main:
+            logger.info("Resuming from %s", resume_from)
+        restored = _load_checkpoint_for_resume(
+            ckpt_path=resume_from, model=model, optimizer=optimizer,
+            scheduler=scheduler, sampler=sampler, device=device,
+        )
+        start_epoch = restored["start_epoch"]
+        global_step = restored["global_step"]
+        best_score = restored["best_score"]
+        artifacts.best_epoch = restored["best_epoch"]
+        patience_counter = restored["patience_counter"]
+        if ddp.is_main:
+            logger.info(
+                "Resumed: start_epoch=%d global_step=%d best_score=%.4f best_epoch=%d patience=%d",
+                start_epoch, global_step, best_score, artifacts.best_epoch, patience_counter,
+            )
+        if start_epoch >= cfg.epochs:
+            if ddp.is_main:
+                logger.warning(
+                    "Resumed checkpoint is at epoch %d but cfg.epochs=%d — nothing to do",
+                    start_epoch - 1, cfg.epochs,
+                )
 
     autocast_dtype = torch.bfloat16 if cfg.use_bf16 and device.type == "cuda" else None
 
@@ -611,8 +748,7 @@ def train(
             len(epoch_val_records), len(val_records),
         )
 
-    global_step = 0
-    for epoch in range(cfg.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         sampler.set_epoch(epoch)
         t0 = time.monotonic()
         train_metrics, global_step = _train_one_epoch(
@@ -637,6 +773,11 @@ def train(
         )
         val_elapsed = time.monotonic() - t1
 
+        # Early-stopping decision is computed on rank 0; broadcast to others
+        # so all ranks exit the loop together (otherwise non-rank-0 would hang
+        # on the next sampler.set_epoch + DataLoader iter).
+        stop_signal = torch.zeros(1, device=ddp.device, dtype=torch.int32)
+
         if ddp.is_main:
             eval_result = evaluate(
                 predictions, frames=epoch_val_frames, splits=splits,
@@ -655,25 +796,27 @@ def train(
             }
             artifacts.history.append(epoch_metrics)
 
-            ckpt_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
-            state_to_save = (
-                model.module if isinstance(model, DistributedDataParallel) else model
-            ).state_dict()
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": state_to_save,
-                    "metrics": epoch_metrics,
-                    "cfg": cfg.__dict__,
-                },
-                ckpt_path,
-            )
-
             improved = score > best_score
             if improved:
                 best_score = score
+                patience_counter = 0
                 artifacts.best_epoch = epoch
                 artifacts.best_metrics = dict(epoch_metrics)
+                # best_checkpoint_path set after the save below.
+            else:
+                patience_counter += 1
+
+            ckpt_path = checkpoint_dir / f"epoch_{epoch:03d}.pt"
+            _save_checkpoint(
+                path=ckpt_path,
+                model=model, optimizer=optimizer, scheduler=scheduler,
+                sampler=sampler,
+                epoch=epoch, global_step=global_step,
+                best_score=best_score, best_epoch=artifacts.best_epoch,
+                patience_counter=patience_counter,
+                metrics=epoch_metrics, cfg=cfg,
+            )
+            if improved:
                 artifacts.best_checkpoint_path = ckpt_path
 
             logger.info(
@@ -683,15 +826,26 @@ def train(
                 eval_result.metrics.get("hit_rate_n3", float("nan")),
                 eval_result.metrics.get("presence_auroc", float("nan")),
                 train_elapsed, val_elapsed,
-                "[best]" if improved else "",
+                "[best]" if improved else f"[no-improve {patience_counter}/{cfg.early_stop_patience}]"
+                if cfg.early_stop_patience > 0 else "",
             )
 
             if epoch_callback is not None:
                 epoch_callback(epoch, epoch_metrics, ckpt_path, improved)
 
+            if cfg.early_stop_patience > 0 and patience_counter >= cfg.early_stop_patience:
+                logger.info(
+                    "Early stopping triggered: %d epochs without improvement (best=%d, score=%.4f)",
+                    patience_counter, artifacts.best_epoch, best_score,
+                )
+                stop_signal[0] = 1
+
         # All ranks resync before the next epoch's DataLoader iter.
         if ddp.is_distributed:
+            dist.broadcast(stop_signal, src=0)
             dist.barrier()
+        if int(stop_signal.item()) == 1:
+            break
 
     # If per-epoch val was subsampled, run canonical metrics on the full val
     # set once at the end. All ranks participate (sharded inference + gather);
