@@ -122,6 +122,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "dive's line is confident AND the label is in the crop.",
     )
     parser.add_argument(
+        "--soft-snap-inference",
+        action="store_true",
+        help="Apply DESIGN.md §6.2 soft-snap-to-line at inference time. "
+        "Pulls the heatmap argmax toward the dive line (confident dives "
+        "only); blend = sigmoid(line_conf - τ) * (1 - pred_conf), capped "
+        "at --soft-snap-alpha-max. Affects per-epoch val + final-val.",
+    )
+    parser.add_argument(
+        "--soft-snap-alpha-max",
+        type=float,
+        default=0.3,
+        help="Maximum blend weight α for soft-snap. DESIGN guidance: ≤ 0.3.",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -244,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
         heatmap_pos_weight=args.heatmap_pos_weight,
         early_stop_patience=args.early_stop_patience,
         lambda_line=args.lambda_line,
+        inference_soft_snap=args.soft_snap_inference,
+        inference_soft_snap_alpha_max=args.soft_snap_alpha_max,
     )
 
     resume_from: Path | None = None

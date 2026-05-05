@@ -45,6 +45,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--presence-threshold", type=float, default=0.5)
     parser.add_argument(
+        "--soft-snap-inference",
+        action="store_true",
+        help="Apply DESIGN.md §6.2 soft-snap-to-line at inference time.",
+    )
+    parser.add_argument(
+        "--soft-snap-alpha-max", type=float, default=0.3,
+    )
+    parser.add_argument(
         "--no-mlflow", action="store_true",
         help="Skip MLflow logging; just print metrics.",
     )
@@ -96,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     cfg = TrainConfig(**{k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__})
+    # Override saved-cfg's soft-snap settings with the CLI flags so this
+    # script can A/B the same checkpoint with and without the snap.
+    cfg.inference_soft_snap = args.soft_snap_inference
+    cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
     )

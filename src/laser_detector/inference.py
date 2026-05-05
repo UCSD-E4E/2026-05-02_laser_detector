@@ -104,6 +104,61 @@ class FramePrediction:
     pred_confidence: float
 
 
+def _project_point_onto_line(
+    x: float, y: float, a: float, b: float, c: float
+) -> tuple[float, float]:
+    """Orthogonal projection of (x, y) onto the line `a*x + b*y + c = 0`.
+
+    With (a, b) unit-normalized (`a^2 + b^2 = 1`, as Phase 0 produces),
+    the formula simplifies to `p_proj = p - (a*x + b*y + c) * (a, b)`."""
+    norm_sq = a * a + b * b
+    if norm_sq <= 1e-12:
+        return x, y  # degenerate line — return point as-is
+    t = (a * x + b * y + c) / norm_sq
+    return x - t * a, y - t * b
+
+
+def soft_snap_to_line(
+    x: float, y: float, *,
+    line_abc: tuple[float, float, float],
+    line_confidence: float,
+    pred_confidence: float,
+    tau_line: float = 5.0,
+    alpha_max: float = 0.3,
+) -> tuple[float, float, float]:
+    """Project (x, y) toward the dive line per DESIGN.md §6.2:
+
+        final_xy = (1 - α) * argmax + α * project(argmax, line)
+
+    α blends in line proximity smoothly. We want α high when the prediction
+    is uncertain and the line is confident; α low when the prediction is
+    already confident. Concretely:
+
+        α_raw  = sigmoid(line_confidence - τ_line) * (1 - pred_confidence)
+        α      = clip(α_raw, 0, alpha_max)
+
+    The `(1 - pred_confidence)` factor keeps high-confidence predictions
+    free to disagree with the line — useful when the line itself is wrong
+    on a particular frame. `alpha_max=0.3` caps the snap so even an
+    uncertain prediction won't be wholly displaced; matches the "α small,
+    ≤ 0.3" guidance in DESIGN.
+
+    Returns `(final_x, final_y, alpha)` so the caller can log α for tuning.
+    """
+    a, b, c = line_abc
+    line_strength = 1.0 / (1.0 + np.exp(-(line_confidence - tau_line)))
+    alpha_raw = float(line_strength * (1.0 - pred_confidence))
+    alpha = max(0.0, min(alpha_raw, alpha_max))
+    if alpha <= 0.0:
+        return x, y, 0.0
+    proj_x, proj_y = _project_point_onto_line(x, y, a, b, c)
+    return (
+        (1.0 - alpha) * x + alpha * proj_x,
+        (1.0 - alpha) * y + alpha * proj_y,
+        alpha,
+    )
+
+
 @torch.inference_mode()
 def predict_frame(
     image_bgr: np.ndarray,
@@ -116,6 +171,10 @@ def predict_frame(
     batch_size: int = 8,
     presence_threshold: float | None = None,
     autocast_dtype: torch.dtype | None = torch.bfloat16,
+    line_abc: tuple[float, float, float] | None = None,
+    line_confidence: float = 0.0,
+    tau_line: float = 5.0,
+    alpha_max: float = 0.3,
 ) -> FramePrediction:
     """Run tiled inference on a single 4K frame.
 
@@ -176,6 +235,17 @@ def predict_frame(
         # Don't report predictions inside the reflect-padded margin.
         pred_x = min(pred_x, float(grid.original_w - 1))
         pred_y = min(pred_y, float(grid.original_h - 1))
+        # Optional soft-snap toward the dive's line (DESIGN.md §6.2).
+        if line_abc is not None and line_confidence > 0.0:
+            pred_x, pred_y, _alpha = soft_snap_to_line(
+                pred_x, pred_y,
+                line_abc=line_abc,
+                line_confidence=line_confidence,
+                pred_confidence=presence_max,
+                tau_line=tau_line, alpha_max=alpha_max,
+            )
+            pred_x = max(0.0, min(pred_x, float(grid.original_w - 1)))
+            pred_y = max(0.0, min(pred_y, float(grid.original_h - 1)))
     return FramePrediction(
         pred_x=pred_x, pred_y=pred_y, pred_confidence=presence_max
     )

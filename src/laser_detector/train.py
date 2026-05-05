@@ -91,6 +91,13 @@ class TrainConfig:
     # val pass at the end produces the canonical metrics.
     val_subsample_per_epoch: int = 200
     val_subsample_seed: int = 0
+    # DESIGN.md §6.2 soft-snap inference. When True, val inference projects
+    # the heatmap argmax toward the dive's line on confident-line dives,
+    # blended by α = sigmoid(line_conf - τ) * (1 - pred_conf), capped at
+    # `inference_soft_snap_alpha_max`. Default off so it's an opt-in
+    # comparison rather than silently changing val numbers.
+    inference_soft_snap: bool = False
+    inference_soft_snap_alpha_max: float = 0.3
     # Per-step metric logging cadence (rank-0 only). 0 disables it; default 50
     # gives ~850 data points across a 10-epoch full-corpus run, which renders
     # as a smooth loss curve in MLflow / TensorBoard. Per-epoch metrics are
@@ -610,12 +617,21 @@ def _run_val_inference(
                 "image_id": rec.image_id, "pred_x": None, "pred_y": None, "pred_confidence": 0.0,
             })
             continue
+        snap_line_abc = (
+            rec.line_abc
+            if (cfg.inference_soft_snap and rec.is_line_confident and rec.line_abc is not None)
+            else None
+        )
+        snap_line_conf = rec.line_confidence if snap_line_abc is not None else 0.0
         pred = predict_frame(
             image_bgr, inference_model,
             wavelength=rec.wavelength,
             device=device,
             batch_size=cfg.inference_batch_size,
             autocast_dtype=autocast_dtype,
+            line_abc=snap_line_abc,
+            line_confidence=snap_line_conf,
+            alpha_max=cfg.inference_soft_snap_alpha_max,
         )
         rows.append({
             "image_id": rec.image_id,
