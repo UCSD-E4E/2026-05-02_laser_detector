@@ -51,7 +51,23 @@ Server: `https://mlflow.krg.ucsd.edu`, experiment `2026-05-02_laser_detector` (i
 
 ## What to launch first when the server comes back
 
-The 50-epoch DESIGN-spec run with the Phase 3 stack:
+A Phase 3 50-epoch run was started at 18:10 on 2026-05-04 (`boa61k4d0`)
+and cut short by a planned data-center maintenance shutdown. The latest
+saved checkpoint is in `data/phase2/checkpoints_phase3/`. Resume with:
+
+```bash
+uv run torchrun --standalone --nproc_per_node=4 scripts/run_train.py \
+  --epochs 50 --batch-size 16 --num-workers 4 --prefetch-factor 2 \
+  --warmup-steps 1000 --heatmap-loss bce --heatmap-pos-weight 1000 \
+  --lambda-line 0.1 --soft-snap-inference --soft-snap-alpha-max 0.3 \
+  --early-stop-patience 10 \
+  --checkpoint-dir data/phase2/checkpoints_phase3 \
+  --resume auto
+```
+
+If the resume itself fails for any reason, fall through to a fresh run
+of the same command without `--resume auto` (full 10-h run from
+scratch):
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=4 scripts/run_train.py \
@@ -79,9 +95,33 @@ run dies partway.
 - **Resume with extended schedule** not tested — resuming a 5-epoch run
   with `--epochs 10` may have scheduler-state discontinuity, see the
   same notes file.
-- **Soft-snap A/B eval** in progress at the time of writing
-  (`bp3jk3f3t`); ETA ~17:58. Will tell us if the snap helps the
-  existing checkpoint before we commit to a 50-epoch run with it on.
+- **L_line at λ=0.1 broke localization** in tonight's Phase 3 run
+  (epoch 18 final-val: hit_rate_n3=0.001 vs the no-L_line baseline's
+  0.383). The heatmap learned "land somewhere on the line" instead of
+  "land at the labeled point." Next attempt: λ_line ∈ {0.001, 0.01}
+  so heatmap loss + presence loss still dominate.
+
+## Line-prior leakage caveat
+
+The per-dive RANSAC line is fit (Phase 0 §3.1) from **every positive
+label in the dive**, including val and test labels. Soft-snap (§6.2)
+on val/test therefore uses the labels we're scoring against — a
+dive-level information leak.
+
+How to interpret numbers reported in this repo:
+
+- **Without soft-snap**: leakage-free. Lower bound on production.
+- **With soft-snap**: leaks dive-level info. Upper bound assuming the
+  dive's line is already known (existing dives, not first-contact).
+
+For production deployment on a brand-new dive, soft-snap stays off
+until the §6.3 cold-start bootstrap (run model → cluster colors → fit
+line from accumulated high-confidence predictions → re-infer with
+refinement) finishes. Cold-start performance is the no-snap number.
+
+The `L_line` aux loss does NOT leak: it only sees train-dive batches.
+Val/test weights are never directly touched by their own line params.
+The leakage is purely an *inference-time, soft-snap-only* phenomenon.
 
 ## Memories worth re-reading
 

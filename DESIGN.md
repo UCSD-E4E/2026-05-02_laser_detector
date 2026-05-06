@@ -209,9 +209,21 @@ Per-epoch full-val on 4309 frames at ~1 s/frame = ~72 min/epoch is unworkable ac
 
 Subsample variance is high — at 3-pixel tolerance with ~190 positives, a single run's hit_rate can swing ±0.10 between epochs purely from sampling noise. The "best by subsample" checkpoint has empirically agreed with "best by full-val" in Phase 2 runs, but this should be verified by re-evaluating the selected checkpoint on the full val split (`scripts/eval_checkpoint.py`).
 
-### 5.5 Inference-prior independence
+### 5.5 Inference-prior independence and the line-leakage caveat
 
-The model takes **only image + wavelength**. The line prior never enters the model directly — it only appears as auxiliary supervision and as optional post-processing (§6.2). This keeps the model usable on new dives where no line is available yet.
+The model takes **only image + wavelength**. The line prior never enters the model directly — it only appears as auxiliary supervision (`L_line`, §5.1) and as optional post-processing (§6.2). This keeps the model usable on new dives where no line is available yet.
+
+**Leakage caveat**: the line for any given dive is fit (Phase 0 §3.1) from **every positive label in that dive**, including val and test labels. So when soft-snap inference (§6.2) runs on val/test:
+
+- the soft-snap projection is informed by the exact labels we're then scoring against — a dive-level information leak.
+- this is structural to the line-prior approach: the prior is *per-dive*, and even the dive-level train/val split can't separate "labels used to fit the line" from "labels used to score the model" within the same val dive.
+
+**How to interpret reported numbers**:
+- **Without soft-snap**: leakage-free. Lower bound on production performance.
+- **With soft-snap**: includes leakage. Upper bound assuming the dive's line is already known (which is true for dives that have run through Phase 0 — i.e. existing dives, not first-contact ones).
+- For production (new dive, no line yet): see §6.3 cold-start. Soft-snap is off until enough high-confidence predictions accumulate to fit a line.
+
+The `L_line` aux loss does **not** leak into val/test: it only sees train-dive batches and only contributes gradient during training. The val pass evaluates a model whose weights were never directly touched by val-dive line params.
 
 ---
 
@@ -251,10 +263,12 @@ If the dive's `line_confidence` exceeds `τ_line`, project the argmax toward the
 
 ```
 final_xy = (1 - α) * argmax_xy + α * project(argmax_xy, line)
-α = sigmoid_blend(line_confidence, prediction_confidence)
+α = clip(sigmoid(line_confidence - τ_line) * (1 - pred_confidence), 0, alpha_max)
 ```
 
-`α` is small (≤ 0.3) when prediction confidence is high and the model is already near the line; larger when the model is uncertain.
+`α` is small (≤ `alpha_max`, default 0.3) when prediction confidence is high and the model is already near the line; larger when the model is uncertain. Implemented as `inference.soft_snap_to_line` and gated by `cfg.inference_soft_snap`.
+
+**Eval-time vs production behavior** — see §5.5. Reporting val/test metrics with soft-snap on is appropriate only for "existing dive" performance; new-dive (cold-start) performance is the no-snap number until §6.3 bootstrap completes.
 
 ### 6.3 Cold-start (new dives)
 
@@ -412,6 +426,7 @@ Each phase ends with metrics logged to MLflow and a go/no-go before moving on.
 - **Future rig changes**: when new rigs arrive, the per-rig prior assumption breaks. Mitigation: `rig_id` tagged from Phase 0 so we can train per-rig models without re-touching the dataset. Single unified cross-rig model is explicitly out of scope.
 - **UUV deployment gap**: the model trained on a server GPU has to eventually run at 20 fps on edge. We instrument latency from Phase 2 to keep the gap honest, but real port effort is deferred. Avoiding exotic backbone ops is the cheap insurance we're paying now. Current per-frame latency on RTX 4500 Ada at 4K with 15 tiles: ~950 ms (compute-bound; bs=1 ≈ bs=8). UUV target is 50 ms/frame; 19× gap to close — Phase 5 cascade alone can plausibly cut tile count from 15 to ~3, and TensorRT INT8 typically yields 2–4× more.
 - **Disk/I/O pressure during training**: at 4 ranks × 6 dataloader workers × prefetch=2 the random-access pattern on a 331 GB image cache can saturate NVMe even when most pages are RAM-cached, contending with other server processes. Phase 2 production runs use 4 ranks × 4 workers × prefetch=2 as a stable middle ground. Bumping further is fine in isolation but should be coordinated with anything else doing heavy disk on the host.
+- **Line-prior leakage in val/test reporting**: the dive-level RANSAC line is fit from every positive label in the dive, including val/test labels. Soft-snap (§6.2) on val/test therefore uses the very labels we're scoring against. Mitigation: report numbers both with and without soft-snap so the leakage-free lower bound is always visible. Production cold-start is no-snap-until-bootstrap, so the with-snap number is "existing-dive" performance, not "first-contact" performance.
 
 ### Open questions
 
