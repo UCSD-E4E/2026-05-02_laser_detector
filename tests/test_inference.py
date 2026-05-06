@@ -17,6 +17,7 @@ from laser_detector.inference import (
     _project_point_onto_line,
     compute_tile_grid,
     predict_frame,
+    predict_frame_with_cascade,
     soft_snap_to_line,
 )
 from laser_detector.model import LaserDetector
@@ -169,3 +170,32 @@ def test_predict_frame_soft_snap_pulls_into_line_band():
     no_snap_dist = abs(no_snap.pred_y - 100.0)
     snap_dist = abs(snapped.pred_y - 100.0)
     assert snap_dist <= no_snap_dist + 1e-6  # never overshoots
+
+
+def test_cascade_returns_no_detection_when_coarse_does():
+    """If coarse pass returns None xy (presence below threshold), cascade does too."""
+    model = LaserDetector(encoder_weights=None).eval()
+    image = np.random.default_rng(0).integers(0, 255, size=(800, 600, 3), dtype=np.uint8)
+    pred = predict_frame_with_cascade(
+        image, model,
+        wavelength="red",
+        device=torch.device("cpu"),
+        autocast_dtype=None,
+        presence_threshold=2.0,  # impossible to exceed
+    )
+    assert pred.pred_x is None and pred.pred_y is None
+
+
+def test_cascade_returns_in_bounds_pred():
+    model = LaserDetector(encoder_weights=None).eval()
+    image = np.random.default_rng(1).integers(0, 255, size=(800, 600, 3), dtype=np.uint8)
+    pred = predict_frame_with_cascade(
+        image, model,
+        wavelength="green",
+        device=torch.device("cpu"),
+        autocast_dtype=None,
+        refine_window=256,
+    )
+    assert pred.pred_x is not None and pred.pred_y is not None
+    assert 0 <= pred.pred_x <= 599
+    assert 0 <= pred.pred_y <= 799

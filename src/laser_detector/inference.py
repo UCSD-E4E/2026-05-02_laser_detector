@@ -257,3 +257,117 @@ class _NullCtx:
 
     def __exit__(self, *args):
         return False
+
+
+@torch.inference_mode()
+def predict_frame_with_cascade(
+    image_bgr: np.ndarray,
+    model: torch.nn.Module,
+    *,
+    wavelength: str | None,
+    device: torch.device,
+    tile: int = DEFAULT_TILE_SIZE,
+    overlap: int = DEFAULT_TILE_OVERLAP,
+    batch_size: int = 8,
+    presence_threshold: float | None = None,
+    autocast_dtype: torch.dtype | None = torch.bfloat16,
+    line_abc: tuple[float, float, float] | None = None,
+    line_confidence: float = 0.0,
+    tau_line: float = 5.0,
+    alpha_max: float = 0.3,
+    refine_window: int = 256,
+) -> FramePrediction:
+    """Two-pass inference (Phase 5 cascade, DESIGN.md §9 followup).
+
+    Pass 1: same global tiled inference as `predict_frame` to find the coarse
+    laser location (or "no detection").
+    Pass 2: re-run the model on a single `refine_window`-sized crop centered
+    on the pass-1 argmax, take its argmax, and translate back to frame coords.
+
+    The audit on epoch_007 (2026-05-06) showed bimodal per-frame errors:
+    most frames are within 1-3 px of the label, the rest are 1000+ px off.
+    A meaningful fraction of the "1000+ px" cluster are cases where the
+    correct tile won the argmax race but the wrong sub-pixel was selected
+    *within* that tile because of a confuser blob nearby. Refining around
+    the coarse argmax should rescue those.
+
+    `refine_window` defaults to the tile size; smaller values (e.g. 128)
+    focus the refinement tighter at the cost of false-localization risk.
+    """
+    coarse = predict_frame(
+        image_bgr, model,
+        wavelength=wavelength, device=device,
+        tile=tile, overlap=overlap, batch_size=batch_size,
+        presence_threshold=presence_threshold,
+        autocast_dtype=autocast_dtype,
+        line_abc=None, line_confidence=0.0,  # snap only after refinement
+    )
+    if coarse.pred_x is None or coarse.pred_y is None:
+        return coarse
+
+    h, w = image_bgr.shape[:2]
+    half = refine_window // 2
+    cx = int(round(coarse.pred_x))
+    cy = int(round(coarse.pred_y))
+
+    # Crop window, clamped to image bounds; then reflect-pad to refine_window.
+    x0 = max(0, cx - half)
+    y0 = max(0, cy - half)
+    x1 = min(w, x0 + refine_window)
+    y1 = min(h, y0 + refine_window)
+    x0 = max(0, x1 - refine_window)
+    y0 = max(0, y1 - refine_window)
+    crop = image_bgr[y0:y1, x0:x1]
+    crop = _reflect_pad(crop, refine_window, refine_window)
+
+    wavelength_value = (
+        WAVELENGTH_CHANNEL.get(wavelength, UNKNOWN_WAVELENGTH_CHANNEL)
+        if wavelength is not None
+        else UNKNOWN_WAVELENGTH_CHANNEL
+    )
+    arr = _preprocess_tile(crop, wavelength_value)
+    batch = torch.from_numpy(arr[None]).to(device, non_blocking=True)
+
+    autocast_ctx = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype)
+        if autocast_dtype is not None and device.type == "cuda"
+        else _NullCtx()
+    )
+    with autocast_ctx:
+        out = model(batch)
+    heatmap_probs = torch.sigmoid(out["heatmap_logits"][0]).float()
+    presence_prob = float(torch.sigmoid(out["presence_logits"][0]).max().item())
+
+    flat = heatmap_probs.view(-1)
+    refined_idx = int(flat.argmax().item())
+    refined_value = float(flat.max().item())
+    local_y, local_x = divmod(refined_idx, refine_window)
+    refined_x = float(x0 + local_x)
+    refined_y = float(y0 + local_y)
+
+    # Only accept the refinement if the local heatmap actually has a peak; if
+    # presence drops below threshold or the local peak is much weaker than
+    # the coarse one, fall back to coarse.
+    if presence_threshold is not None and presence_prob < presence_threshold:
+        return coarse
+    if refined_value < 0.5 * coarse.pred_confidence:
+        return coarse
+
+    refined_x = max(0.0, min(refined_x, float(w - 1)))
+    refined_y = max(0.0, min(refined_y, float(h - 1)))
+
+    final_conf = max(coarse.pred_confidence, presence_prob)
+    if line_abc is not None and line_confidence > 0.0:
+        refined_x, refined_y, _alpha = soft_snap_to_line(
+            refined_x, refined_y,
+            line_abc=line_abc,
+            line_confidence=line_confidence,
+            pred_confidence=final_conf,
+            tau_line=tau_line, alpha_max=alpha_max,
+        )
+        refined_x = max(0.0, min(refined_x, float(w - 1)))
+        refined_y = max(0.0, min(refined_y, float(h - 1)))
+
+    return FramePrediction(
+        pred_x=refined_x, pred_y=refined_y, pred_confidence=final_conf,
+    )
