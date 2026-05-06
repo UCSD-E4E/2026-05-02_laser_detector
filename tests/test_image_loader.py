@@ -10,6 +10,7 @@ import pytest
 
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
+    CachingLinearImageLoader,
     LocalFilesystemImageLoader,
     NullImageLoader,
 )
@@ -92,3 +93,62 @@ def test_caching_loader_rejects_empty_checksum(tmp_path: Path):
     cache = CachingImageLoader(inner=_MemoryLoader(), cache_dir=tmp_path / "cache")
     with pytest.raises(ValueError):
         cache.load("frame.jpg", "")
+
+
+class _Linear16BitLoader:
+    """Test loader that returns synthetic uint16 BGR images keyed by checksum."""
+
+    def __init__(self, size: tuple[int, int] = (32, 32)) -> None:
+        self.size = size
+        self.calls: list[str] = []
+
+    def load(self, image_path: str, checksum: str) -> np.ndarray | None:
+        self.calls.append(checksum)
+        rng = np.random.default_rng(int(checksum, 16) % (2**32))
+        return rng.integers(0, 65536, size=(*self.size, 3), dtype=np.uint16)
+
+
+def test_linear_caching_loader_round_trips_uint16(tmp_path: Path):
+    inner = _Linear16BitLoader()
+    cache = CachingLinearImageLoader(inner=inner, cache_dir=tmp_path / "cache")
+    checksum = "abcdef1234567890"
+
+    first = cache.load("ignored", checksum)
+    assert first is not None
+    assert first.dtype == np.uint16
+    assert len(inner.calls) == 1
+    assert cache.cache_path(checksum).exists()
+    assert cache.cache_path(checksum).suffix == ".png"
+
+    second = cache.load("ignored", checksum)
+    assert second is not None
+    assert second.dtype == np.uint16
+    assert len(inner.calls) == 1
+    np.testing.assert_array_equal(first, second)
+
+
+def test_linear_caching_loader_uses_two_level_fanout(tmp_path: Path):
+    cache = CachingLinearImageLoader(
+        inner=_Linear16BitLoader(), cache_dir=tmp_path / "cache"
+    )
+    checksum = "feedbeef00ff"
+    cache.load("ignored", checksum)
+    expected = tmp_path / "cache" / "fe" / "ed" / f"{checksum}.png"
+    assert expected.exists()
+
+
+def test_linear_caching_loader_rejects_empty_checksum(tmp_path: Path):
+    cache = CachingLinearImageLoader(
+        inner=_Linear16BitLoader(), cache_dir=tmp_path / "cache"
+    )
+    with pytest.raises(ValueError):
+        cache.load("frame.png", "")
+
+
+def test_linear_caching_loader_invalid_compression(tmp_path: Path):
+    with pytest.raises(ValueError):
+        CachingLinearImageLoader(
+            inner=_Linear16BitLoader(),
+            cache_dir=tmp_path / "cache",
+            png_compression=11,
+        )

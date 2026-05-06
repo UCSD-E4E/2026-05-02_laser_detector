@@ -58,6 +58,22 @@ def test_chromaticity_norm_handles_black_pixel_without_blowup():
     assert np.isfinite(chrom).all()
 
 
+def test_chromaticity_norm_handles_uint16_input():
+    """Linear cache (CachingLinearImageLoader) emits uint16 BGR; chromaticity
+    output should be ratio-equivalent to the uint8 equivalent (modulo rounding)."""
+    img8 = np.array([[[100, 50, 25]]], dtype=np.uint8)
+    img16 = (img8.astype(np.uint16) * 257)  # scale 0..255 → 0..65535
+    chrom8 = _chromaticity_norm(img8)
+    chrom16 = _chromaticity_norm(img16)
+    np.testing.assert_allclose(chrom8, chrom16, atol=1e-4)
+
+
+def test_chromaticity_norm_uint16_black_pixel():
+    img = np.zeros((1, 1, 3), dtype=np.uint16)
+    chrom = _chromaticity_norm(img)
+    assert np.isfinite(chrom).all()
+
+
 def test_make_gaussian_heatmap_peak_is_at_label():
     hm = _make_gaussian_heatmap(50.0, 30.0, 100, 100, sigma_px=3.0)
     assert hm.shape == (100, 100)

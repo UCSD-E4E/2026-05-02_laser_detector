@@ -53,6 +53,33 @@ def _decode_with_fishsense_core(path: Path) -> np.ndarray | None:
         return None
 
 
+def _decode_raw_linear(path: Path) -> np.ndarray | None:
+    """Decode a RAW file with rawpy directly: linear, 16-bit, no CLAHE.
+
+    Returns uint16 BGR (downstream OpenCV convention). Skips fishsense-core
+    on purpose: the project-standard pipeline applies CLAHE, which saturates
+    bright laser blobs across all channels and destroys wavelength selectivity
+    (see notes/state.md "Audit findings"). For laser detection we want the raw
+    sensor data while keeping demosaicing + camera white balance.
+    """
+    import rawpy  # noqa: PLC0415 — lazy, big native library
+
+    try:
+        with rawpy.imread(str(path)) as raw:
+            rgb = raw.postprocess(
+                output_bps=16,
+                gamma=(1, 1),                 # linear (no gamma correction)
+                no_auto_bright=True,           # don't auto-stretch the histogram
+                use_camera_wb=True,            # apply camera white balance
+                output_color=rawpy.ColorSpace.sRGB,
+            )
+    except Exception as exc:
+        logger.warning("rawpy linear decode failed for %s: %s", path, exc)
+        return None
+    # rawpy returns RGB; downstream expects BGR.
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
 class LocalFilesystemImageLoader:
     """Loads images from the local filesystem under a configurable root.
 
@@ -130,6 +157,85 @@ class CachingImageLoader:
             return image
         # Atomic write: bytes → temp file → rename. Filename suffix is irrelevant
         # since we did the encoding ourselves.
+        tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+        tmp_path.write_bytes(encoded.tobytes())
+        tmp_path.rename(cache_path)
+        return image
+
+
+class LocalFilesystemLinearRawImageLoader:
+    """Like LocalFilesystemImageLoader, but uses `_decode_raw_linear` for ORF.
+
+    Returns uint16 BGR for RAW inputs (linear, no CLAHE). Non-RAW files load
+    via `cv2.imread(IMREAD_UNCHANGED)` so 16-bit TIFFs/PNGs preserve their bit
+    depth.
+
+    This loader DELIBERATELY DEVIATES from the CLAUDE.md guidance to use
+    fishsense-core for ORF decode. Other fishsense models should keep using
+    the project-standard pipeline; only the laser detector's input pipeline
+    skips CLAHE — see notes/state.md.
+    """
+
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+
+    def load(self, image_path: str, checksum: str) -> np.ndarray | None:
+        path = Path(image_path)
+        if not path.is_absolute():
+            path = self.root / path
+        if not path.exists():
+            return None
+        if path.suffix.lower() in RAW_EXTENSIONS:
+            return _decode_raw_linear(path)
+        return cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+
+
+class CachingLinearImageLoader:
+    """Decorator that caches uint16 BGR images as 16-bit PNGs keyed by checksum.
+
+    Mirrors `CachingImageLoader`'s API but the cache format is lossless 16-bit
+    PNG (~3-5x compression on linear sensor data, ~10-15 MB per 4K frame).
+    """
+
+    def __init__(
+        self,
+        inner: ImageLoader,
+        cache_dir: Path | str,
+        png_compression: int = 6,
+    ):
+        self.inner = inner
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if not 0 <= int(png_compression) <= 9:
+            raise ValueError("png_compression must be in [0, 9]")
+        self.png_compression = int(png_compression)
+
+    def cache_path(self, checksum: str) -> Path:
+        if not checksum:
+            raise ValueError("checksum must be non-empty")
+        return self.cache_dir / checksum[:2] / checksum[2:4] / f"{checksum}.png"
+
+    def load(self, image_path: str, checksum: str) -> np.ndarray | None:
+        cache_path = self.cache_path(checksum)
+        if cache_path.exists():
+            cached = cv2.imread(str(cache_path), cv2.IMREAD_UNCHANGED)
+            if cached is not None:
+                return cached
+            logger.warning(
+                "Cache file unreadable, re-decoding: %s", cache_path
+            )
+
+        image = self.inner.load(image_path, checksum)
+        if image is None:
+            return None
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        ok, encoded = cv2.imencode(
+            ".png", image, [cv2.IMWRITE_PNG_COMPRESSION, self.png_compression]
+        )
+        if not ok:
+            logger.warning("Failed to encode PNG cache for %s", checksum)
+            return image
         tmp_path = cache_path.with_name(cache_path.name + ".tmp")
         tmp_path.write_bytes(encoded.tobytes())
         tmp_path.rename(cache_path)

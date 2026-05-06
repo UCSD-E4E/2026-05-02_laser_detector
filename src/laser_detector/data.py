@@ -58,14 +58,16 @@ def _photometric_augs() -> A.Compose:
     )
 
 
-def _chromaticity_norm(image_rgb_u8: np.ndarray, eps: float = 1e-3) -> np.ndarray:
+def _chromaticity_norm(image_rgb: np.ndarray, eps: float = 1e-3) -> np.ndarray:
     """RGB → chromaticity in [0, 1] per channel: c_i = R_i / sum(R+G+B), clipped.
 
-    Returns float32 [H, W, 3]. Reduces sensitivity to underwater attenuation by
-    discarding overall brightness — model still sees color *ratios*. Per
-    DESIGN.md §4.1.
+    Returns float32 [H, W, 3]. Accepts uint8 (JPEG cache) or uint16 (linear
+    cache from `CachingLinearImageLoader`). Reduces sensitivity to underwater
+    attenuation by discarding overall brightness — model sees color *ratios*.
+    Per DESIGN.md §4.1.
     """
-    rgb = image_rgb_u8.astype(np.float32) / 255.0
+    scale = 65535.0 if image_rgb.dtype == np.uint16 else 255.0
+    rgb = image_rgb.astype(np.float32) / scale
     intensity = rgb.sum(axis=2, keepdims=True)
     intensity = np.maximum(intensity, eps)
     return rgb / intensity
