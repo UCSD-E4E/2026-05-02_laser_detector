@@ -95,19 +95,49 @@ Worst dives (mean_err): 427 (green, 829), 354 (green, 600), 422
 
 ## Next steps
 
-1. **Close the wavelength gap** — highest-leverage knob:
-   - Per-wavelength sampler weights (4× upweight green in
-     `HardNegativeBalancedSampler`).
-   - Heavier hue/saturation augmentation (currently photometric augs
-     are mild).
-   - Two-headed model (separate red vs green prediction heads).
-2. **Phase 5 cascade** — refinement crop around argmax. The bimodal
-   error shape says ~half of misses are "wrong tile selected, right
-   region nearby" candidates that a refinement pass could rescue.
-3. **Phase 4 sweep** — only after #1 has narrowed the gap, then sweep
-   pos_weight × σ × presence_threshold.
-4. **Fix `train.py` final-val** — load best_checkpoint before the
+The dominant remaining gap (red 0.57 vs green 0.30) is structural:
+JPEG/CLAHE saturates bright laser blobs in all RGB channels and
+destroys the wavelength selectivity that chromaticity normalization
+relies on. Per-dive contrast measurements (`/tmp/check_chrom.py`)
+showed green=0.07-0.08 vs red=0.16-0.40. **The fix is to re-extract
+the cache from ORF without CLAHE, in 16-bit linear data.**
+
+1. **Re-extract cache from ORF (step 2)** — pipeline ready,
+   blocked on NAS mount:
+   - `LocalFilesystemLinearRawImageLoader` uses rawpy directly (no
+     CLAHE, gamma=1, 16-bit). Deliberately deviates from CLAUDE.md's
+     "use fishsense-core" guidance — laser-specific.
+   - `CachingLinearImageLoader` writes lossless 16-bit PNGs.
+   - `_chromaticity_norm` is dtype-aware (uint8 + uint16 both work).
+   - `scripts/prewarm_linear_cache.py` wraps both, parallel decode.
+   - **Blocker**: `/home/c.crutchfield/mnt/fishsense_data/REEF/data`
+     not mounted. Need NAS up before kickoff.
+   - Smoke validation: run `/tmp/smoke_linear.py` on 5 dives to
+     confirm green chromaticity contrast jumps from ~0.08 to >0.4.
+   - Full re-extract: ~6-8h wall-clock at the standard worker count.
+2. **Phase 5 cascade** stub committed:
+   `inference.predict_frame_with_cascade` does pass-1 global tiled +
+   pass-2 refinement crop around argmax. Not yet wired into eval or
+   training; A/B it after step 2.
+3. **Wavelength sampler weights** — defer until step 2 results land
+   (likely fixes most of the gap on its own).
+4. **Phase 4 sweep** — only after we've closed the wavelength gap.
+5. **Fix `train.py` final-val** — load best_checkpoint before the
    final-val pass so MLflow numbers aren't misleading.
+
+## Linear-pipeline kickoff (when NAS is back)
+
+```bash
+# 1. Smoke: 5-dive chromaticity check (laptop-friendly once NAS is mounted)
+uv run python /tmp/smoke_linear.py     # expect green contrast jump
+
+# 2. Full re-extract (parallel decode; ~6-8h)
+uv run python scripts/prewarm_linear_cache.py --splits train val test
+
+# 3. New training run on linear cache (10h)
+#    Need to point training scripts at the new cache via a CLI flag
+#    or settings override — not yet wired; will be a small follow-up.
+```
 
 ## Open items
 
