@@ -37,6 +37,7 @@ from laser_detector.preprocessing.config import load_config
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
     LocalFilesystemImageLoader,
+    make_cached_image_loader,
 )
 from laser_detector.tracking import setup_mlflow
 from laser_detector.train import (
@@ -142,6 +143,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Resume training from a checkpoint. Path to a .pt file, or 'auto' "
         "to pick the highest-numbered epoch_NNN.pt in --checkpoint-dir.",
     )
+    parser.add_argument(
+        "--image-pipeline",
+        choices=("jpeg", "linear"),
+        default="jpeg",
+        help="`jpeg`: legacy uint8 cache via fishsense-core (default). "
+        "`linear`: rawpy-direct uint16 PNG cache, no CLAHE — see "
+        "notes/state.md 'Audit findings'.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Override the cache directory. Defaults to config.cache_dir for "
+        "the JPEG pipeline; <cache_dir>_linear/ for the linear pipeline.",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,12 +214,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    inner = LocalFilesystemImageLoader(config.image_root)
-    image_loader = CachingImageLoader(
-        inner=inner,
-        cache_dir=config.cache_dir,
+    cache_dir = args.cache_dir or (
+        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        else config.cache_dir
+    )
+    image_loader = make_cached_image_loader(
+        config.image_root, cache_dir,
+        pipeline=args.image_pipeline,
         jpeg_quality=config.cache_jpeg_quality,
     )
+    if ddp.is_main:
+        logging.info(
+            "Image pipeline: %s (cache=%s)", args.image_pipeline, cache_dir,
+        )
 
     frames = pl.read_parquet(config.data_dir / "frames.parquet")
     splits = pl.read_parquet(config.data_dir / "dive_splits.parquet")

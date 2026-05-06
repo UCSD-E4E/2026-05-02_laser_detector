@@ -43,6 +43,7 @@ from laser_detector.preprocessing.config import load_config
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
     LocalFilesystemImageLoader,
+    make_cached_image_loader,
 )
 from laser_detector.train import (
     TrainConfig,
@@ -72,6 +73,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--from-cache", action="store_true",
         help="Load predictions_with_meta.parquet from --out-dir; skip inference. "
         "Audit-only path that doesn't need a GPU.",
+    )
+    p.add_argument(
+        "--image-pipeline",
+        choices=("jpeg", "linear"),
+        default="jpeg",
+        help="`jpeg`/`linear` — must match the pipeline the checkpoint was trained on.",
+    )
+    p.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help="Override cache directory.",
     )
     return p.parse_args(argv)
 
@@ -178,7 +189,7 @@ def plot_summary(per_frame: pl.DataFrame, per_dive: pl.DataFrame, out_path: Path
 def plot_worst_dives(
     per_frame: pl.DataFrame,
     per_dive: pl.DataFrame,
-    image_loader: CachingImageLoader,
+    image_loader,
     out_dir: Path,
     n: int,
     plot_all: bool = False,
@@ -199,11 +210,14 @@ def plot_worst_dives(
         if not cache_path.exists():
             logging.warning("dive %s: no cached JPEG, skipping plot", dive_id)
             continue
-        img_bgr = cv2.imread(str(cache_path))
+        img_bgr = cv2.imread(str(cache_path), cv2.IMREAD_UNCHANGED)
         if img_bgr is None:
             logging.warning("dive %s: cv2.imread returned None, skipping", dive_id)
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        # Linear cache stores uint16; matplotlib needs [0,1] floats or uint8.
+        if img_rgb.dtype == np.uint16:
+            img_rgb = (img_rgb.astype(np.float32) / 65535.0).clip(0, 1)
 
         labels_xy = rows.select("label_x", "label_y").to_numpy()
         preds_xy = rows.select("pred_x", "pred_y").to_numpy()
@@ -242,10 +256,13 @@ def run_inference(
         format=f"%(asctime)s [r{ddp.rank}] [%(levelname)s] %(name)s: %(message)s",
     )
 
-    inner = LocalFilesystemImageLoader(config.image_root)
-    image_loader = CachingImageLoader(
-        inner=inner,
-        cache_dir=config.cache_dir,
+    cache_dir = args.cache_dir or (
+        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        else config.cache_dir
+    )
+    image_loader = make_cached_image_loader(
+        config.image_root, cache_dir,
+        pipeline=args.image_pipeline,
         jpeg_quality=config.cache_jpeg_quality,
     )
 
@@ -339,11 +356,14 @@ def main(argv: list[str] | None = None) -> int:
         with pl.Config(tbl_rows=20, tbl_cols=10):
             print(crosstab)
 
-    # Plots — needs a CachingImageLoader. Build a fresh one (cheap).
-    inner = LocalFilesystemImageLoader(config.image_root)
-    image_loader = CachingImageLoader(
-        inner=inner,
-        cache_dir=config.cache_dir,
+    # Plots — build a loader matching the pipeline used at inference.
+    cache_dir = args.cache_dir or (
+        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        else config.cache_dir
+    )
+    image_loader = make_cached_image_loader(
+        config.image_root, cache_dir,
+        pipeline=args.image_pipeline,
         jpeg_quality=config.cache_jpeg_quality,
     )
     plot_worst_dives(

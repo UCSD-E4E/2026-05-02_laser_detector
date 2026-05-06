@@ -27,6 +27,7 @@ from laser_detector.preprocessing.config import load_config
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
     LocalFilesystemImageLoader,
+    make_cached_image_loader,
 )
 from laser_detector.tracking import setup_mlflow
 from laser_detector.train import (
@@ -56,6 +57,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-mlflow", action="store_true",
         help="Skip MLflow logging; just print metrics.",
     )
+    parser.add_argument(
+        "--image-pipeline",
+        choices=("jpeg", "linear"),
+        default="jpeg",
+        help="`jpeg`/`linear` — must match the pipeline the checkpoint was trained on.",
+    )
+    parser.add_argument(
+        "--cache-dir", type=Path, default=None,
+        help="Override cache directory.",
+    )
     return parser.parse_args(argv)
 
 
@@ -68,9 +79,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     config = load_config()
 
-    inner = LocalFilesystemImageLoader(config.image_root)
-    image_loader = CachingImageLoader(
-        inner=inner, cache_dir=config.cache_dir, jpeg_quality=config.cache_jpeg_quality,
+    cache_dir = args.cache_dir or (
+        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        else config.cache_dir
+    )
+    image_loader = make_cached_image_loader(
+        config.image_root, cache_dir,
+        pipeline=args.image_pipeline,
+        jpeg_quality=config.cache_jpeg_quality,
     )
 
     frames = pl.read_parquet(config.data_dir / "frames.parquet")

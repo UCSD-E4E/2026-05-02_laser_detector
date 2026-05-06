@@ -242,6 +242,36 @@ class CachingLinearImageLoader:
         return image
 
 
+def make_cached_image_loader(
+    image_root: Path | str,
+    cache_dir: Path | str,
+    *,
+    pipeline: str = "jpeg",
+    jpeg_quality: int = 95,
+    png_compression: int = 6,
+):
+    """Build a checksum-keyed image loader chain.
+
+    `pipeline` selects:
+    - "jpeg"   — current default. uint8 BGR via fishsense-core (rawpy + auto-gamma
+                 + CLAHE), cached as JPEGs. Matches the rest of the fishsense ecosystem.
+    - "linear" — laser-detector-specific. uint16 BGR via rawpy direct (linear,
+                 no CLAHE), cached as 16-bit PNGs. See notes/state.md "Audit findings"
+                 for why we deviate.
+    """
+    if pipeline == "linear":
+        inner = LocalFilesystemLinearRawImageLoader(image_root)
+        return CachingLinearImageLoader(
+            inner=inner, cache_dir=cache_dir, png_compression=png_compression,
+        )
+    if pipeline == "jpeg":
+        inner = LocalFilesystemImageLoader(image_root)
+        return CachingImageLoader(
+            inner=inner, cache_dir=cache_dir, jpeg_quality=jpeg_quality,
+        )
+    raise ValueError(f"unknown pipeline: {pipeline!r}")
+
+
 class NullImageLoader:
     """A loader that always returns None.
 
