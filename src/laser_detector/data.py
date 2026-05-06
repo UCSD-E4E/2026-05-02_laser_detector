@@ -42,7 +42,10 @@ UNKNOWN_WAVELENGTH_CHANNEL = 0.5
 
 
 def _photometric_augs() -> A.Compose:
-    """Per DESIGN.md §5.2: photometric only. No flip/rotate/affine."""
+    """Per DESIGN.md §5.2: photometric only. No flip/rotate/affine.
+
+    For uint8 inputs (JPEG cache). HSV + ImageCompression require uint8.
+    """
     return A.Compose(
         [
             A.HueSaturationValue(
@@ -54,6 +57,24 @@ def _photometric_augs() -> A.Compose:
             A.GaussianBlur(blur_limit=(3, 5), p=0.2),
             A.GaussNoise(p=0.2),
             A.ImageCompression(quality_range=(70, 95), p=0.2),
+        ]
+    )
+
+
+def _photometric_augs_linear() -> A.Compose:
+    """Variant for uint16 linear-cache inputs.
+
+    Drops HueSaturationValue (HSV needs uint8) and ImageCompression (encodes
+    JPEG, uint8-only). Keeps brightness/contrast/blur/noise — these are
+    dtype-agnostic in albumentations.
+    """
+    return A.Compose(
+        [
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2, contrast_limit=0.2, p=0.5
+            ),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.GaussNoise(p=0.2),
         ]
     )
 
@@ -195,6 +216,7 @@ class LaserTileDataset(Dataset):
         positive_center_p: float = DEFAULT_POSITIVE_CENTER_P,
         edge_pad_px: int = DEFAULT_LABEL_EDGE_PAD_PX,
         augment: bool = True,
+        linear_cache: bool = False,
         seed: int = 0,
     ):
         self.records = records
@@ -204,7 +226,13 @@ class LaserTileDataset(Dataset):
         self.positive_center_p = float(positive_center_p)
         self.edge_pad_px = int(edge_pad_px)
         self.augment = bool(augment)
-        self._aug_pipeline = _photometric_augs() if augment else None
+        self.linear_cache = bool(linear_cache)
+        if augment:
+            self._aug_pipeline = (
+                _photometric_augs_linear() if linear_cache else _photometric_augs()
+            )
+        else:
+            self._aug_pipeline = None
         self._seed = int(seed)
         self._rng: np.random.Generator | None = None  # lazy-init per worker
 

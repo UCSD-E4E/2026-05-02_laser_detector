@@ -107,6 +107,10 @@ class TrainConfig:
     # bailing. 0 disables; the recommended default for 50-epoch runs is ~10
     # given subsample variance can make 3-4-epoch dips look real.
     early_stop_patience: int = 0
+    # When True, the dataset uses uint16-compatible photometric augs (drops
+    # HueSaturationValue + ImageCompression which are uint8-only). Set this
+    # via run_train.py's `--image-pipeline linear`.
+    linear_cache: bool = False
 
 
 @dataclass
@@ -693,11 +697,13 @@ def train(
 
     train_ds = LaserTileDataset(
         records=train_records, loader=image_loader, augment=True,
+        linear_cache=cfg.linear_cache,
         seed=cfg.seed + ddp.rank,
     )
     # Single-process dataset used for scoring negatives between epochs.
     score_ds = LaserTileDataset(
         records=train_records, loader=image_loader, augment=False,
+        linear_cache=cfg.linear_cache,
         seed=cfg.seed + 1 + ddp.rank,
     )
     sampler = HardNegativeBalancedSampler(

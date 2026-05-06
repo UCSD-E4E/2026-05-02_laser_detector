@@ -74,6 +74,16 @@ def test_chromaticity_norm_uint16_black_pixel():
     assert np.isfinite(chrom).all()
 
 
+def test_photometric_augs_linear_accepts_uint16():
+    """Linear-cache aug pipeline must round-trip uint16 without dtype loss."""
+    from laser_detector.data import _photometric_augs_linear
+
+    img = np.random.default_rng(0).integers(0, 65536, (64, 64, 3), dtype=np.uint16)
+    out = _photometric_augs_linear()(image=img)["image"]
+    assert out.dtype == np.uint16
+    assert out.shape == img.shape
+
+
 def test_make_gaussian_heatmap_peak_is_at_label():
     hm = _make_gaussian_heatmap(50.0, 30.0, 100, 100, sigma_px=3.0)
     assert hm.shape == (100, 100)
