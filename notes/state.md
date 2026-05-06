@@ -1,107 +1,123 @@
-# Current state — 2026-05-04 evening
+# Current state — 2026-05-06 afternoon
 
 A quick reference for picking up tomorrow or after a server outage.
 
 ## Where we are
 
-- **Phase 0**: refreshed today (2026-05-04 morning). 264 dives, 33,320
-  frames after upstream supersession dropped ~28% of positive labels
-  (43,834 → 31,469). All `superseded=False` in the parquet because
-  upstream filters server-side.
+- **Phase 0**: refreshed 2026-05-04. 264 dives, 33,320 frames after
+  upstream supersession dropped ~28% of positive labels (43,834 →
+  31,469). All `superseded=False` in the parquet because upstream
+  filters server-side.
 - **Phase 1**: classical-CV baseline — done (commit `fc27aaa`).
-- **Phase 2**: BCE+pos_weight production run done. 4 checkpoints
-  full-val'd. **Best**: epoch_002 on cleaned data → `hit_rate_n3=0.383`,
-  `hit_rate_n4=0.540`, `auroc=0.854`, `fpr=0.146`.
-- **Phase 3 code**: wired and committed today, **not yet trained on**:
-  - `L_line` aux loss (`--lambda-line 0.1` → DESIGN default)
-  - Soft-snap-to-line inference (`--soft-snap-inference`)
-  - Resume from checkpoint (`--resume auto`)
-  - Early stopping (`--early-stop-patience N`)
-- **Phase 4**: hyperparameter sweep harness — not started.
+- **Phase 2**: BCE+pos_weight=1000 production run, 50 epochs, soft-snap
+  inference, no L_line. Early-stopped at epoch 17 (best=epoch 7).
+  **Best**: `checkpoints_bce_clean_50e/epoch_007.pt` →
+  `hit_rate_n3=0.477, hit_rate_n4=0.614, auroc=0.857, fpr=0.099`.
+- **Phase 3**: code wired and committed. **L_line is harmful at every λ
+  tested** (0.1 → 0.001 collapse, 0.01 → 0.000 collapse). Soft-snap
+  inference *is* fine and gives +0.3pp on Phase 2's epoch_002 (0.383 →
+  0.386). See memory `l_line_aux_loss_harmful.md`. L_line training term
+  is shelved until we have a warm-start or windowed variant.
+- **Phase 4** (sweep): not started. Audit findings should drive sweep
+  axes — see "Next steps" below.
+- **Failure audit**: done. `scripts/audit_failures.py` produces
+  per-dive metrics, wavelength × line-quartile crosstab, per-dive
+  overlay plots, and a summary chart. Outputs in
+  `data/audit/<checkpoint-stem>/`.
 
-## Production checkpoints
+## Top checkpoints
 
-Cleaned data, 4-GPU DDP, 10 epochs, BCE+pos_weight=1000:
+Cleaned data, 4-GPU DDP, BCE+pos_weight=1000:
 
-| ckpt | hit_n3 | hit_n4 | AUROC | FPR | mean_err |
-| --- | --- | --- | --- | --- | --- |
-| **epoch_002** | **0.383** | **0.540** | 0.854 | 0.146 | 281 |
-| epoch_005 | 0.086 | 0.142 | 0.865 | **0.068** | 271 |
-| epoch_008 | 0.203 | 0.427 | 0.872 | 0.167 | **216** |
-| epoch_009 | 0.095 | 0.227 | **0.872** | 0.141 | 247 |
+| run | ckpt | hit_n3 | hit_n4 | AUROC | FPR | mean_err |
+| --- | --- | --- | --- | --- | --- | --- |
+| 50e (2026-05-06) | **epoch_007** | **0.477** | **0.614** | 0.857 | 0.099 | 265 |
+| 10e (2026-05-04) | epoch_002 | 0.383 | 0.540 | 0.854 | 0.146 | 281 |
+
+50-epoch run extended Phase 2 by 7 epochs of useful learning before
+val plateaued; +9.4 pp hit_n3 from the same recipe just running longer.
+Soft-snap inference enabled (caveat: see "Line-prior leakage" below).
 
 Locations on the server (relative to repo root):
 
-- `data/phase2/checkpoints_bce_clean/epoch_*.pt` — production cleaned data
-- `data/phase2/checkpoints_bce/epoch_*.pt` — yesterday's dirty data run
-- `data/phase2/checkpoints/` — yesterday's lr=3e-4 focal collapse run
-- `data/phase2/checkpoints_lr1e3/` — yesterday's lr=1e-3 focal collapse run
+- `data/phase2/checkpoints_bce_clean_50e/epoch_*.pt` — production 50e
+- `data/phase2/checkpoints_bce_clean/epoch_*.pt` — prior 10e
+- `data/phase2/checkpoints_phase3_l001/` — failed L_line λ=0.01
+- `data/phase2/checkpoints_phase3/` — failed L_line λ=0.1
+- `data/phase2/checkpoints_bce/`, `checkpoints/`, `checkpoints_lr1e3/` —
+  earlier dirty-data + focal-collapse runs
 
-## MLflow runs
+## MLflow
 
-Server: `https://mlflow.krg.ucsd.edu`, experiment `2026-05-02_laser_detector` (id 2).
+Server: `https://mlflow.krg.ucsd.edu`, experiment
+`2026-05-02_laser_detector` (id 2).
 
-| run name | notes | run_id |
+| run | name / tag | run_id |
 | --- | --- | --- |
-| `phase2_train` (focal lr=3e-4) | failed: focal collapse | `06644ed4e7ae43b99d3b587aea290c0e` |
-| `phase2_train` (focal lr=1e-3) | failed: same collapse | `825ad00473f64d7da0a2716e36045c05` |
-| `phase2_train` (BCE dirty data) | first BCE escape | `45ea5165dc8d48939c621fb201fce25f` |
-| `phase2_train` (BCE clean data) | best Phase 2 result so far | (see MLflow UI; latest with `world_size=4` tag) |
-| `phase2_eval_*` | per-checkpoint full-val standalone runs | search by tag `phase2_eval_only` |
+| BCE 50e clean (best) | `phase2_train` | `8083d9380c124f26b7922365b98503c0` |
+| Phase 3 λ=0.01 (failed) | `phase2_train` | (search by date 2026-05-06 morning) |
+| Phase 3 λ=0.1 (failed) | `phase2_train` | (search by tag) |
+| BCE 10e clean | `phase2_train` | (latest with `world_size=4`) |
+| eval-only | tag `phase2_eval_only` | search by tag |
 
-## What to launch first when the server comes back
+Note: the 50e run's MLflow `final/*` metrics are on the *epoch-17*
+weights, not best. Use `eval_checkpoint.py` results for the canonical
+number. See memory `end_of_run_final_val_uses_last_weights.md`.
 
-A Phase 3 50-epoch run was started at 18:10 on 2026-05-04 (`boa61k4d0`)
-and cut short by a planned data-center maintenance shutdown. The latest
-saved checkpoint is in `data/phase2/checkpoints_phase3/`. Resume with:
+## Audit findings (epoch_007, 2026-05-06)
 
-```bash
-uv run torchrun --standalone --nproc_per_node=4 scripts/run_train.py \
-  --epochs 50 --batch-size 16 --num-workers 4 --prefetch-factor 2 \
-  --warmup-steps 1000 --heatmap-loss bce --heatmap-pos-weight 1000 \
-  --lambda-line 0.1 --soft-snap-inference --soft-snap-alpha-max 0.3 \
-  --early-stop-patience 10 \
-  --checkpoint-dir data/phase2/checkpoints_phase3 \
-  --resume auto
-```
+`data/audit/epoch_007/` has:
 
-If the resume itself fails for any reason, fall through to a fresh run
-of the same command without `--resume auto` (full 10-h run from
-scratch):
+- `summary.png` — two-panel chart: per-dive median-vs-mean scatter
+  (catastrophic dives sit far above y=x) + per-frame error histogram
+  showing **bimodal** "right or completely lost" distribution.
+- `per_dive_metrics.parquet` — sorted worst-first.
+- `wavelength_x_lineq.parquet` — slice table.
+- `plots/<dive_id>.png` — labels (red) and predictions (cyan) overlaid
+  for all 26 val dives.
 
-```bash
-uv run torchrun --standalone --nproc_per_node=4 scripts/run_train.py \
-  --epochs 50 \
-  --batch-size 16 \
-  --num-workers 4 --prefetch-factor 2 \
-  --warmup-steps 1000 \
-  --heatmap-loss bce --heatmap-pos-weight 1000 \
-  --lambda-line 0.1 \
-  --soft-snap-inference --soft-snap-alpha-max 0.3 \
-  --early-stop-patience 10 \
-  --checkpoint-dir data/phase2/checkpoints_phase3
-```
+Key takeaways:
 
-ETA at 12 min/epoch on cleaned data: ~10 h, less if early stopping
-fires. Resume with `--resume auto --checkpoint-dir <same path>` if the
-run dies partway.
+1. **Wavelength gap is structural**: red hit_n3 ≈ 0.57, green ≈ 0.30.
+   Persists across line-confidence quartiles. Mixed-color frames are
+   rare (75/31k) so it's not a label-quality issue. See memory
+   `wavelength_performance_gap.md`.
+2. **Bimodal errors**: model is either within 1-3 px (hits) or 1000+ px
+   off (catastrophic confusers). Very few in between. This points
+   toward Phase 5 cascade (refinement crop) being a high-leverage move
+   alongside any retraining.
+3. **Line prior buys little**: red q1→q4 is 0.56→0.62, green q3→q4 is
+   non-monotonic.
+
+Worst dives (mean_err): 427 (green, 829), 354 (green, 600), 422
+(green, 586), 421 (green, 514), 460 (green, 448), 114 (red, 382), 400
+(green, 341), 455 (green, 339).
+
+## Next steps
+
+1. **Close the wavelength gap** — highest-leverage knob:
+   - Per-wavelength sampler weights (4× upweight green in
+     `HardNegativeBalancedSampler`).
+   - Heavier hue/saturation augmentation (currently photometric augs
+     are mild).
+   - Two-headed model (separate red vs green prediction heads).
+2. **Phase 5 cascade** — refinement crop around argmax. The bimodal
+   error shape says ~half of misses are "wrong tile selected, right
+   region nearby" candidates that a refinement pass could rescue.
+3. **Phase 4 sweep** — only after #1 has narrowed the gap, then sweep
+   pos_weight × σ × presence_threshold.
+4. **Fix `train.py` final-val** — load best_checkpoint before the
+   final-val pass so MLflow numbers aren't misleading.
 
 ## Open items
 
 - **NAS-path issues** on dives 219, 249 — frames missing on disk;
   filter-loadable drops them silently. Investigation upstream pending.
-- **Failure audit script** not written yet; see
-  [laptop_friendly_tasks.md](laptop_friendly_tasks.md#1-failure-audit-script-scriptsaudit_failurespy-most-valuable).
-- **Resume with extended schedule** not tested — resuming a 5-epoch run
-  with `--epochs 10` may have scheduler-state discontinuity, see the
-  same notes file.
-- **L_line at λ=0.1 broke localization** in tonight's Phase 3 run
-  (epoch 18 final-val: hit_rate_n3=0.001 vs the no-L_line baseline's
-  0.383). The heatmap learned "land somewhere on the line" instead of
-  "land at the labeled point." Next attempt: λ_line ∈ {0.001, 0.01}
-  so heatmap loss + presence loss still dominate.
+- **Resume with extended schedule** untested — resuming a 5-epoch run
+  with `--epochs 10` may have scheduler-state discontinuity.
+  Workaround: re-run from scratch when extending.
 
-## Line-prior leakage caveat
+## Line-prior leakage caveat (unchanged)
 
 The per-dive RANSAC line is fit (Phase 0 §3.1) from **every positive
 label in the dive**, including val and test labels. Soft-snap (§6.2)
@@ -114,12 +130,13 @@ How to interpret numbers reported in this repo:
 - **With soft-snap**: leaks dive-level info. Upper bound assuming the
   dive's line is already known (existing dives, not first-contact).
 
-For production deployment on a brand-new dive, soft-snap stays off
-until the §6.3 cold-start bootstrap (run model → cluster colors → fit
-line from accumulated high-confidence predictions → re-infer with
-refinement) finishes. Cold-start performance is the no-snap number.
+The 50e run's 0.477 was reported with soft-snap on. Leakage uplift is
+small (+0.3pp on epoch_002), but worth flagging when comparing.
 
-The `L_line` aux loss does NOT leak: it only sees train-dive batches.
+For production deployment on a brand-new dive, soft-snap stays off
+until the §6.3 cold-start bootstrap finishes.
+
+The `L_line` aux loss does NOT leak: only sees train-dive batches.
 Val/test weights are never directly touched by their own line params.
 The leakage is purely an *inference-time, soft-snap-only* phenomenon.
 
@@ -127,9 +144,9 @@ The leakage is purely an *inference-time, soft-snap-only* phenomenon.
 
 In `~/.claude/projects/.../memory/`:
 
-- `superseded_label_filtering.md` — why filter is a no-op until Phase 0 re-runs
-- `negative_frames_are_sparse.md` — only 4% of corpus is negative → hard-neg mining essential
-- `bf16_focal_loss_nan.md` — fp32 loss under bf16 autocast required
-- `training_run_preferences.md` — full resume required for big runs (now wired)
-- `dive_data_quality_issues.md` — dives 237/219/249 NAS issues
-- `wavelength_data_mismatch.md` — ~42% of dives are mixed-color
+- `l_line_aux_loss_harmful.md` — don't re-enable without warm-start
+- `wavelength_performance_gap.md` — green is the bottleneck
+- `end_of_run_final_val_uses_last_weights.md` — re-eval after early stop
+- `superseded_label_filtering.md`, `negative_frames_are_sparse.md`,
+  `bf16_focal_loss_nan.md`, `training_run_preferences.md`,
+  `dive_data_quality_issues.md`, `wavelength_data_mismatch.md`
