@@ -11,6 +11,7 @@ import pytest
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
     CachingLinearImageLoader,
+    CachingLinearNpyImageLoader,
     LocalFilesystemImageLoader,
     NullImageLoader,
 )
@@ -152,3 +153,23 @@ def test_linear_caching_loader_invalid_compression(tmp_path: Path):
             cache_dir=tmp_path / "cache",
             png_compression=11,
         )
+
+
+def test_linear_npy_caching_loader_round_trips_uint16(tmp_path: Path):
+    inner = _Linear16BitLoader()
+    cache = CachingLinearNpyImageLoader(inner=inner, cache_dir=tmp_path / "cache")
+    checksum = "cafebabe12345678"
+
+    first = cache.load("ignored", checksum)
+    assert first is not None
+    assert first.dtype == np.uint16
+    assert len(inner.calls) == 1
+    assert cache.cache_path(checksum).exists()
+    assert cache.cache_path(checksum).suffix == ".npy"
+
+    # Round-trip is exact (uncompressed).
+    second = cache.load("ignored", checksum)
+    assert second is not None
+    assert second.dtype == np.uint16
+    assert len(inner.calls) == 1  # served from cache
+    np.testing.assert_array_equal(first, second)

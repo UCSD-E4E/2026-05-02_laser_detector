@@ -145,11 +145,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-pipeline",
-        choices=("jpeg", "linear"),
+        choices=("jpeg", "linear", "linear_npy"),
         default="jpeg",
         help="`jpeg`: legacy uint8 cache via fishsense-core (default). "
         "`linear`: rawpy-direct uint16 PNG cache, no CLAHE — see "
-        "notes/state.md 'Audit findings'.",
+        "notes/state.md 'Audit findings'. `linear_npy`: same source, .npy "
+        "cache for faster dataloader.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -215,7 +216,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cache_dir = args.cache_dir or (
-        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        Path(f"{config.cache_dir}_linear_npy") if args.image_pipeline == "linear_npy"
+        else Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
         else config.cache_dir
     )
     image_loader = make_cached_image_loader(
@@ -283,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         lambda_line=args.lambda_line,
         inference_soft_snap=args.soft_snap_inference,
         inference_soft_snap_alpha_max=args.soft_snap_alpha_max,
+        linear_cache=args.image_pipeline.startswith("linear"),
     )
 
     resume_from: Path | None = None

@@ -242,6 +242,59 @@ class CachingLinearImageLoader:
         return image
 
 
+class CachingLinearNpyImageLoader:
+    """Decorator that caches uint16 BGR images as uncompressed `.npy` files.
+
+    Tradeoff vs `CachingLinearImageLoader` (16-bit PNG):
+    - Files are larger (~72 MB uncompressed vs ~60 MB PNG) — modest.
+    - Decode is essentially memcpy via np.load → 5–10x faster than PNG decode,
+      which makes training I/O-bound rather than CPU-bound on the dataloader.
+
+    `mmap_mode='r'` is used at read time so only the actual bytes that downstream
+    code touches get paged in. With cropping in the dataset, that's typically
+    one tile (~6 MB) instead of the full 72 MB image.
+    """
+
+    def __init__(self, inner: ImageLoader, cache_dir: Path | str):
+        self.inner = inner
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def cache_path(self, checksum: str) -> Path:
+        if not checksum:
+            raise ValueError("checksum must be non-empty")
+        return self.cache_dir / checksum[:2] / checksum[2:4] / f"{checksum}.npy"
+
+    def load(self, image_path: str, checksum: str) -> np.ndarray | None:
+        cache_path = self.cache_path(checksum)
+        if cache_path.exists():
+            try:
+                # mmap_mode='r' avoids loading the whole array into RAM up front.
+                # Downstream code that crops a tile pages in only those bytes.
+                cached = np.load(cache_path, mmap_mode="r")
+                # Return a writable copy so callers can crop / augment freely
+                # without backing-file constraints. Even with the copy, this is
+                # significantly faster than PNG decode.
+                return np.array(cached)
+            except Exception as exc:
+                logger.warning(
+                    "Cache file unreadable, re-decoding: %s (%s)", cache_path, exc
+                )
+
+        image = self.inner.load(image_path, checksum)
+        if image is None:
+            return None
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+        # np.save would append ".npy" if given a Path; pass an open handle to
+        # disable that behavior and atomic-rename ourselves.
+        with open(tmp_path, "wb") as f:
+            np.save(f, image, allow_pickle=False)
+        tmp_path.rename(cache_path)
+        return image
+
+
 def make_cached_image_loader(
     image_root: Path | str,
     cache_dir: Path | str,
@@ -253,12 +306,17 @@ def make_cached_image_loader(
     """Build a checksum-keyed image loader chain.
 
     `pipeline` selects:
-    - "jpeg"   — current default. uint8 BGR via fishsense-core (rawpy + auto-gamma
-                 + CLAHE), cached as JPEGs. Matches the rest of the fishsense ecosystem.
-    - "linear" — laser-detector-specific. uint16 BGR via rawpy direct (linear,
-                 no CLAHE), cached as 16-bit PNGs. See notes/state.md "Audit findings"
-                 for why we deviate.
+    - "jpeg"       — current default. uint8 BGR via fishsense-core (rawpy + auto-gamma
+                     + CLAHE), cached as JPEGs. Matches the rest of the fishsense ecosystem.
+    - "linear"     — laser-detector-specific. uint16 BGR via rawpy direct (linear,
+                     no CLAHE), cached as 16-bit PNGs. See notes/state.md "Audit findings".
+    - "linear_npy" — same source as "linear" but cached as uncompressed `.npy`. Larger
+                     on disk (~72 MB/file vs 60 MB) but ~10x faster decode at training
+                     time, which keeps the dataloader off the bottleneck.
     """
+    if pipeline == "linear_npy":
+        inner = LocalFilesystemLinearRawImageLoader(image_root)
+        return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
     if pipeline == "linear":
         inner = LocalFilesystemLinearRawImageLoader(image_root)
         return CachingLinearImageLoader(

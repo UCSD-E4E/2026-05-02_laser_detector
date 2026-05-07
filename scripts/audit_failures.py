@@ -76,9 +76,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--image-pipeline",
-        choices=("jpeg", "linear"),
+        choices=("jpeg", "linear", "linear_npy"),
         default="jpeg",
-        help="`jpeg`/`linear` — must match the pipeline the checkpoint was trained on.",
+        help="`jpeg`/`linear`/`linear_npy` — must match the pipeline the checkpoint was trained on.",
     )
     p.add_argument(
         "--cache-dir", type=Path, default=None,
@@ -210,9 +210,12 @@ def plot_worst_dives(
         if not cache_path.exists():
             logging.warning("dive %s: no cached JPEG, skipping plot", dive_id)
             continue
-        img_bgr = cv2.imread(str(cache_path), cv2.IMREAD_UNCHANGED)
+        if cache_path.suffix == ".npy":
+            img_bgr = np.load(cache_path)
+        else:
+            img_bgr = cv2.imread(str(cache_path), cv2.IMREAD_UNCHANGED)
         if img_bgr is None:
-            logging.warning("dive %s: cv2.imread returned None, skipping", dive_id)
+            logging.warning("dive %s: failed to load cache file, skipping", dive_id)
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         # Linear cache stores uint16; matplotlib needs [0,1] floats or uint8.
@@ -257,7 +260,8 @@ def run_inference(
     )
 
     cache_dir = args.cache_dir or (
-        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        Path(f"{config.cache_dir}_linear_npy") if args.image_pipeline == "linear_npy"
+        else Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
         else config.cache_dir
     )
     image_loader = make_cached_image_loader(
@@ -358,7 +362,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Plots — build a loader matching the pipeline used at inference.
     cache_dir = args.cache_dir or (
-        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        Path(f"{config.cache_dir}_linear_npy") if args.image_pipeline == "linear_npy"
+        else Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
         else config.cache_dir
     )
     image_loader = make_cached_image_loader(

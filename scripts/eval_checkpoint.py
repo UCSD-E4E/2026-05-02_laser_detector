@@ -59,9 +59,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-pipeline",
-        choices=("jpeg", "linear"),
+        choices=("jpeg", "linear", "linear_npy"),
         default="jpeg",
-        help="`jpeg`/`linear` — must match the pipeline the checkpoint was trained on.",
+        help="`jpeg`/`linear`/`linear_npy` — must match the pipeline the checkpoint was trained on.",
     )
     parser.add_argument(
         "--cache-dir", type=Path, default=None,
@@ -80,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config()
 
     cache_dir = args.cache_dir or (
-        Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
+        Path(f"{config.cache_dir}_linear_npy") if args.image_pipeline == "linear_npy"
+        else Path(f"{config.cache_dir}_linear") if args.image_pipeline == "linear"
         else config.cache_dir
     )
     image_loader = make_cached_image_loader(
