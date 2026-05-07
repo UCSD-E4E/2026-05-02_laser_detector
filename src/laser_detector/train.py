@@ -34,7 +34,7 @@ from laser_detector.data import (
     build_records,
 )
 from laser_detector.eval import PREDICTION_TABLE_SCHEMA, evaluate
-from laser_detector.inference import predict_frame
+from laser_detector.inference import predict_frame, rig_prior_log_mask_batched
 from laser_detector.model import (
     LaserDetector,
     bce_heatmap_loss,
@@ -111,6 +111,18 @@ class TrainConfig:
     # HueSaturationValue + ImageCompression which are uint8-only). Set this
     # via run_train.py's `--image-pipeline linear`.
     linear_cache: bool = False
+    # When True, the per-tile heatmap is multiplied by the static rig-prior
+    # mask before argmax. See inference._rig_prior_for_tile.
+    inference_rig_prior: bool = False
+    # Gaussian floor inside the bbox. 1.0 = pure bbox (Gaussian disabled).
+    # None falls back to inference.DEFAULT_RIG_PRIOR_FLOOR.
+    inference_rig_prior_floor: float | None = None
+    # When True, the static rig-prior log-mask is added to heatmap logits
+    # *during training* before BCE, so the model learns its outputs against
+    # an inference-time consistent prior. Pairs with `inference_rig_prior`.
+    train_rig_prior: bool = False
+    # Floor for the training-time prior. None → DEFAULT_RIG_PRIOR_FLOOR.
+    train_rig_prior_floor: float | None = None
 
 
 @dataclass
@@ -329,6 +341,17 @@ def _train_one_epoch(
         # too coarse for the log-of-clamped-sigmoid in either focal or BCE.
         heatmap_logits = out["heatmap_logits"].float()
         presence_logits = out["presence_logits"].float()
+        if cfg.train_rig_prior:
+            crop_offset = batch["crop_offset"].to(device, non_blocking=True)
+            tile_size = heatmap_logits.shape[-1]
+            log_mask_kwargs: dict = {}
+            if cfg.train_rig_prior_floor is not None:
+                log_mask_kwargs["floor"] = cfg.train_rig_prior_floor
+            log_mask = rig_prior_log_mask_batched(
+                crop_offset, tile_size, **log_mask_kwargs,
+            )  # [B, tile, tile]
+            # heatmap_logits is [B, 1, tile, tile]; broadcast log_mask over channel.
+            heatmap_logits = heatmap_logits + log_mask.unsqueeze(1)
         if cfg.heatmap_loss == "bce":
             loss_hm = bce_heatmap_loss(
                 heatmap_logits, heatmap_target, pos_weight=cfg.heatmap_pos_weight,
@@ -627,6 +650,9 @@ def _run_val_inference(
             else None
         )
         snap_line_conf = rec.line_confidence if snap_line_abc is not None else 0.0
+        rig_prior_kwargs = {"rig_prior": cfg.inference_rig_prior}
+        if cfg.inference_rig_prior_floor is not None:
+            rig_prior_kwargs["rig_prior_floor"] = cfg.inference_rig_prior_floor
         pred = predict_frame(
             image_bgr, inference_model,
             wavelength=rec.wavelength,
@@ -636,6 +662,7 @@ def _run_val_inference(
             line_abc=snap_line_abc,
             line_confidence=snap_line_conf,
             alpha_max=cfg.inference_soft_snap_alpha_max,
+            **rig_prior_kwargs,
         )
         rows.append({
             "image_id": rec.image_id,

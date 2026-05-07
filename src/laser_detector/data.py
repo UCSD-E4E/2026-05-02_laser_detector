@@ -64,9 +64,9 @@ def _photometric_augs() -> A.Compose:
 def _photometric_augs_linear() -> A.Compose:
     """Variant for uint16 linear-cache inputs.
 
-    Drops HueSaturationValue (HSV needs uint8) and ImageCompression (encodes
-    JPEG, uint8-only). Keeps brightness/contrast/blur/noise — these are
-    dtype-agnostic in albumentations.
+    Drops HueSaturationValue (HSV needs uint8), ImageCompression (encodes
+    JPEG, uint8-only), and GaussNoise (cv2.add requires matching dtypes,
+    which fails on uint16 + float32 noise tensors).
     """
     return A.Compose(
         [
@@ -74,7 +74,6 @@ def _photometric_augs_linear() -> A.Compose:
                 brightness_limit=0.2, contrast_limit=0.2, p=0.5
             ),
             A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-            A.GaussNoise(p=0.2),
         ]
     )
 

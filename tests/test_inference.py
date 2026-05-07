@@ -12,12 +12,19 @@ import pytest
 import torch
 
 from laser_detector.inference import (
+    DEFAULT_RIG_PRIOR_BBOX,
+    DEFAULT_RIG_PRIOR_CENTER,
+    DEFAULT_RIG_PRIOR_FLOOR,
+    DEFAULT_RIG_PRIOR_SIGMA,
     DEFAULT_TILE_OVERLAP,
     DEFAULT_TILE_SIZE,
     _project_point_onto_line,
+    _rig_prior_for_tile,
     compute_tile_grid,
     predict_frame,
     predict_frame_with_cascade,
+    rig_prior_log_mask,
+    rig_prior_log_mask_batched,
     soft_snap_to_line,
 )
 from laser_detector.model import LaserDetector
@@ -199,3 +206,80 @@ def test_cascade_returns_in_bounds_pred():
     assert pred.pred_x is not None and pred.pred_y is not None
     assert 0 <= pred.pred_x <= 599
     assert 0 <= pred.pred_y <= 799
+
+
+def test_rig_prior_zeroes_outside_bbox():
+    """Pixels outside the rig-prior bbox should mask to 0."""
+    bbox = (1400, 0, 3000, 2200)
+    center = (2000.0, 1300.0)
+    sigma = (200.0, 300.0)
+    floor = 0.1
+    # Tile at top-left corner of the canvas — entirely outside the bbox in x.
+    mask = _rig_prior_for_tile(0, 0, 1024, bbox, center, sigma, floor)
+    assert mask.shape == (1024, 1024)
+    assert (mask == 0.0).all()
+
+
+def test_rig_prior_peaks_near_center():
+    """A tile centered on the prior center should peak at ~1.0 at the center."""
+    bbox = DEFAULT_RIG_PRIOR_BBOX
+    center = DEFAULT_RIG_PRIOR_CENTER
+    sigma = DEFAULT_RIG_PRIOR_SIGMA
+    # Place tile so its top-left puts the prior center in its interior.
+    cx, cy = center
+    tile_origin_x = int(cx - 256)
+    tile_origin_y = int(cy - 256)
+    mask = _rig_prior_for_tile(
+        tile_origin_x, tile_origin_y, 1024, bbox, center, sigma, DEFAULT_RIG_PRIOR_FLOOR,
+    )
+    # The pixel at (cx, cy) in tile-local coords lives at row=cy-tile_origin_y, col=cx-tile_origin_x.
+    local_row = int(cy) - tile_origin_y
+    local_col = int(cx) - tile_origin_x
+    assert mask[local_row, local_col] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_rig_prior_floors_inside_bbox():
+    """Inside the bbox but far from the Gaussian center, the mask is the floor."""
+    bbox = (0, 0, 4000, 2200)  # encompasses the full canvas in x
+    center = (0.0, 0.0)         # far from any test point
+    sigma = (10.0, 10.0)        # tight Gaussian → exponential ≈ 0 far away
+    floor = 0.15
+    mask = _rig_prior_for_tile(2000, 1000, 1024, bbox, center, sigma, floor)
+    assert mask.min() == pytest.approx(floor, abs=1e-6)
+    assert mask.max() <= 1.0
+
+
+def test_predict_frame_rig_prior_keeps_pred_in_bbox():
+    """Argmax should land inside the prior bbox when rig_prior=True."""
+    model = LaserDetector(encoder_weights=None).eval()
+    image = np.random.default_rng(0).integers(0, 255, size=(2160, 3840, 3), dtype=np.uint8)
+    pred = predict_frame(
+        image, model,
+        wavelength="red",
+        device=torch.device("cpu"),
+        autocast_dtype=None,
+        rig_prior=True,
+    )
+    assert pred.pred_x is not None and pred.pred_y is not None
+    bx0, by0, bx1, by1 = DEFAULT_RIG_PRIOR_BBOX
+    assert bx0 <= pred.pred_x < bx1
+    assert by0 <= pred.pred_y < by1
+
+
+def test_rig_prior_log_mask_batched_matches_numpy_version():
+    """Batched torch implementation should agree with the numpy single-tile version."""
+    crop_offsets = torch.tensor([[1500, 800], [0, 0], [2000, 1300]], dtype=torch.float32)
+    tile = 256
+    batched = rig_prior_log_mask_batched(crop_offsets, tile)
+    assert batched.shape == (3, tile, tile)
+    for i, (ox, oy) in enumerate(crop_offsets.tolist()):
+        ref = rig_prior_log_mask(int(ox), int(oy), tile)
+        np.testing.assert_allclose(batched[i].cpu().numpy(), ref, atol=1e-5)
+
+
+def test_rig_prior_log_mask_batched_floors_outside_bbox():
+    """Outside the bbox the log-mask should hit log(eps) ≈ -9.2."""
+    crop_offsets = torch.tensor([[0, 0]], dtype=torch.float32)  # tile entirely outside bbox in x
+    tile = 128
+    log_mask = rig_prior_log_mask_batched(crop_offsets, tile, eps=1e-4)
+    assert log_mask.max() == pytest.approx(np.log(1e-4), abs=1e-5)

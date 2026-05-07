@@ -159,6 +159,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the cache directory. Defaults to config.cache_dir for "
         "the JPEG pipeline; <cache_dir>_linear/ for the linear pipeline.",
     )
+    parser.add_argument(
+        "--train-rig-prior",
+        action="store_true",
+        help="Add the static rig-prior log-mask to heatmap logits during "
+        "training (before BCE). Bakes the rig geometry into the trained "
+        "weights so train and inference share the same prior assumption.",
+    )
+    parser.add_argument(
+        "--rig-prior-floor",
+        type=float,
+        default=None,
+        help="Override the rig-prior Gaussian floor for both training and "
+        "inference. 1.0 = pure bbox (no Gaussian bias).",
+    )
+    parser.add_argument(
+        "--inference-rig-prior",
+        action="store_true",
+        help="Apply the rig-prior multiplicatively to heatmap probs at "
+        "inference. Use alongside --train-rig-prior or alone.",
+    )
     return parser.parse_args(argv)
 
 
@@ -286,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
         inference_soft_snap=args.soft_snap_inference,
         inference_soft_snap_alpha_max=args.soft_snap_alpha_max,
         linear_cache=args.image_pipeline.startswith("linear"),
+        train_rig_prior=args.train_rig_prior,
+        train_rig_prior_floor=args.rig_prior_floor,
+        inference_rig_prior=args.inference_rig_prior,
+        inference_rig_prior_floor=args.rig_prior_floor,
     )
 
     resume_from: Path | None = None

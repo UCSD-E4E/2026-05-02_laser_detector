@@ -54,6 +54,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--soft-snap-alpha-max", type=float, default=0.3,
     )
     parser.add_argument(
+        "--rig-prior", action="store_true",
+        help="Multiply heatmap by static rig-prior mask (bbox + Gaussian) "
+        "centered on the empirical laser-position distribution. Hard-zeros "
+        "predictions outside the bbox.",
+    )
+    parser.add_argument(
+        "--rig-prior-floor", type=float, default=None,
+        help="Override the Gaussian floor inside the bbox. 1.0 = pure bbox, "
+        "no Gaussian bias. Default: inference module's DEFAULT_RIG_PRIOR_FLOOR.",
+    )
+    parser.add_argument(
         "--no-mlflow", action="store_true",
         help="Skip MLflow logging; just print metrics.",
     )
@@ -125,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     # script can A/B the same checkpoint with and without the snap.
     cfg.inference_soft_snap = args.soft_snap_inference
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
+    cfg.inference_rig_prior = args.rig_prior
+    cfg.inference_rig_prior_floor = args.rig_prior_floor
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
     )

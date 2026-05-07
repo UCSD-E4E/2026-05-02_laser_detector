@@ -61,6 +61,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--soft-snap-inference", action="store_true")
     p.add_argument("--soft-snap-alpha-max", type=float, default=0.3)
     p.add_argument(
+        "--rig-prior", action="store_true",
+        help="Apply static rig-prior bbox+Gaussian mask to heatmap at argmax time.",
+    )
+    p.add_argument(
+        "--rig-prior-floor", type=float, default=None,
+        help="Override the Gaussian floor inside the bbox. 1.0 = pure bbox.",
+    )
+    p.add_argument(
         "--out-dir", type=Path, default=None,
         help="Default: data/audit/<checkpoint-stem>",
     )
@@ -286,6 +294,8 @@ def run_inference(
     })
     cfg.inference_soft_snap = args.soft_snap_inference
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
+    cfg.inference_rig_prior = args.rig_prior
+    cfg.inference_rig_prior_floor = args.rig_prior_floor
 
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
