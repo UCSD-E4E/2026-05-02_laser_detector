@@ -68,6 +68,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rig-prior-floor", type=float, default=None,
         help="Override the Gaussian floor inside the bbox. 1.0 = pure bbox.",
     )
+    p.add_argument("--rig-prior-sigma-x", type=float, default=None)
+    p.add_argument("--rig-prior-sigma-y", type=float, default=None)
+    p.add_argument(
+        "--cascade", action="store_true",
+        help="Use predict_frame_with_cascade refinement at inference.",
+    )
+    p.add_argument("--cascade-refine-window", type=int, default=None)
     p.add_argument(
         "--out-dir", type=Path, default=None,
         help="Default: data/audit/<checkpoint-stem>",
@@ -296,6 +303,10 @@ def run_inference(
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
     cfg.inference_rig_prior = args.rig_prior
     cfg.inference_rig_prior_floor = args.rig_prior_floor
+    cfg.inference_rig_prior_sigma_x = args.rig_prior_sigma_x
+    cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
+    cfg.inference_cascade = args.cascade
+    cfg.inference_cascade_refine_window = args.cascade_refine_window
 
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,

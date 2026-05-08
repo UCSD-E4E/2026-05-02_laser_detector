@@ -216,6 +216,8 @@ class LaserTileDataset(Dataset):
         edge_pad_px: int = DEFAULT_LABEL_EDGE_PAD_PX,
         augment: bool = True,
         linear_cache: bool = False,
+        bayer_excess_loader: ImageLoader | None = None,
+        bayer_excess_scale: float = 4096.0,
         seed: int = 0,
     ):
         self.records = records
@@ -226,6 +228,13 @@ class LaserTileDataset(Dataset):
         self.edge_pad_px = int(edge_pad_px)
         self.augment = bool(augment)
         self.linear_cache = bool(linear_cache)
+        # Optional secondary loader for the Bayer-derived (G_excess, R_excess)
+        # cache. When set, channels are cropped + appended after chromaticity.
+        # `bayer_excess_scale` divides the uint16 values into [0, 1]-ish range;
+        # 4096 is roughly the saturated-laser scale on the 14-bit Olympus sensor
+        # so most laser-dot pixels land near 1.0 while background stays near 0.
+        self.bayer_excess_loader = bayer_excess_loader
+        self.bayer_excess_scale = float(bayer_excess_scale)
         if augment:
             self._aug_pipeline = (
                 _photometric_augs_linear() if linear_cache else _photometric_augs()
@@ -290,8 +299,28 @@ class LaserTileDataset(Dataset):
         wavelength_channel = np.full(
             (self.tile_size, self.tile_size, 1), wavelength_value, dtype=np.float32
         )
-        # 4-channel input: [chrom_r, chrom_g, chrom_b, wavelength]
-        x = np.concatenate([chrom, wavelength_channel], axis=2)
+        channels: list[np.ndarray] = [chrom, wavelength_channel]
+
+        # Optional Bayer-excess channels (G_excess, R_excess) cropped from the
+        # parallel cache and normalized to [0, ~1].
+        if self.bayer_excess_loader is not None:
+            bayer = self.bayer_excess_loader.load(rec.image_path, rec.image_checksum)
+            if bayer is not None:
+                bayer = _reflect_pad_to_tile(bayer, self.tile_size)
+                bayer_crop = bayer[
+                    crop_y : crop_y + self.tile_size,
+                    crop_x : crop_x + self.tile_size,
+                ]
+                bayer_f = bayer_crop.astype(np.float32) / self.bayer_excess_scale
+                channels.append(bayer_f)
+            else:
+                # Pad with zeros if Bayer cache is missing for this frame, so
+                # the input shape is stable. Loss/aug behave the same.
+                channels.append(
+                    np.zeros((self.tile_size, self.tile_size, 2), dtype=np.float32)
+                )
+
+        x = np.concatenate(channels, axis=2)
         # HWC → CHW for torch
         x_chw = np.transpose(x, (2, 0, 1)).copy()
 

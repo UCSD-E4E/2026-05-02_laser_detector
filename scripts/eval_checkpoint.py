@@ -64,6 +64,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the Gaussian floor inside the bbox. 1.0 = pure bbox, "
         "no Gaussian bias. Default: inference module's DEFAULT_RIG_PRIOR_FLOOR.",
     )
+    parser.add_argument("--rig-prior-sigma-x", type=float, default=None)
+    parser.add_argument("--rig-prior-sigma-y", type=float, default=None)
+    parser.add_argument(
+        "--cascade", action="store_true",
+        help="Use predict_frame_with_cascade (Phase 5 refinement crop) "
+        "instead of single-pass predict_frame.",
+    )
+    parser.add_argument(
+        "--cascade-refine-window", type=int, default=None,
+        help="Cascade refinement window size. Default: predict_frame_with_cascade default.",
+    )
     parser.add_argument(
         "--no-mlflow", action="store_true",
         help="Skip MLflow logging; just print metrics.",
@@ -138,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
     cfg.inference_rig_prior = args.rig_prior
     cfg.inference_rig_prior_floor = args.rig_prior_floor
+    cfg.inference_rig_prior_sigma_x = args.rig_prior_sigma_x
+    cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
+    cfg.inference_cascade = args.cascade
+    cfg.inference_cascade_refine_window = args.cascade_refine_window
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
     )

@@ -179,6 +179,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Apply the rig-prior multiplicatively to heatmap probs at "
         "inference. Use alongside --train-rig-prior or alone.",
     )
+    parser.add_argument(
+        "--bayer-excess",
+        action="store_true",
+        help="Add Bayer-derived (G_excess, R_excess) channels as inputs 5-6. "
+        "Requires the prewarmed bayer-excess cache (see prewarm_bayer_excess_cache.py). "
+        "Sets in_channels=6 on the model and loads the parallel cache for "
+        "training/eval.",
+    )
+    parser.add_argument(
+        "--bayer-excess-cache-dir",
+        type=Path,
+        default=None,
+        help="Override the bayer-excess cache dir. Default: <cache_dir>_bayer_excess.",
+    )
     return parser.parse_args(argv)
 
 
@@ -245,9 +259,20 @@ def main(argv: list[str] | None = None) -> int:
         pipeline=args.image_pipeline,
         jpeg_quality=config.cache_jpeg_quality,
     )
+    bayer_excess_loader = None
+    if args.bayer_excess:
+        bayer_cache_dir = args.bayer_excess_cache_dir or Path(
+            f"{config.cache_dir}_bayer_excess"
+        )
+        bayer_excess_loader = make_cached_image_loader(
+            config.image_root, bayer_cache_dir,
+            pipeline="bayer_excess",
+        )
     if ddp.is_main:
         logging.info(
-            "Image pipeline: %s (cache=%s)", args.image_pipeline, cache_dir,
+            "Image pipeline: %s (cache=%s)%s",
+            args.image_pipeline, cache_dir,
+            f"; bayer_excess cache={bayer_cache_dir}" if args.bayer_excess else "",
         )
 
     frames = pl.read_parquet(config.data_dir / "frames.parquet")
@@ -310,6 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         train_rig_prior_floor=args.rig_prior_floor,
         inference_rig_prior=args.inference_rig_prior,
         inference_rig_prior_floor=args.rig_prior_floor,
+        use_bayer_excess=args.bayer_excess,
+        in_channels=6 if args.bayer_excess else 4,
     )
 
     resume_from: Path | None = None
@@ -335,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             train_records=train_records,
             val_records=val_records,
             image_loader=image_loader,
+            bayer_excess_loader=bayer_excess_loader,
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             ddp=ddp,
@@ -352,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             train_records=train_records,
             val_records=val_records,
             image_loader=image_loader,
+            bayer_excess_loader=bayer_excess_loader,
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             ddp=ddp,
@@ -395,6 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             train_records=train_records,
             val_records=val_records,
             image_loader=image_loader,
+            bayer_excess_loader=bayer_excess_loader,
             frames=frames, splits=eval_splits, wavelengths=wavelengths, lines=lines,
             checkpoint_dir=args.checkpoint_dir,
             epoch_callback=_on_epoch,

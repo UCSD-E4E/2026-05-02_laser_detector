@@ -196,14 +196,25 @@ def _reflect_pad(image_bgr: np.ndarray, h: int, w: int) -> np.ndarray:
 
 
 def _preprocess_tile(
-    tile_bgr: np.ndarray, wavelength_value: float
+    tile_bgr: np.ndarray,
+    wavelength_value: float,
+    bayer_excess_tile: np.ndarray | None = None,
+    bayer_excess_scale: float = 4096.0,
 ) -> np.ndarray:
-    """BGR uint8 → float32 [4, H, W] (chromaticity + wavelength)."""
+    """BGR (uint8/uint16) → float32 [C, H, W] tile input.
+
+    C=4 by default: chromaticity (3) + wavelength (1).
+    C=6 when `bayer_excess_tile` is given (uint16 [H, W, 2] of G_excess, R_excess).
+    Bayer values are normalized by `bayer_excess_scale` to land in roughly [0, 1].
+    """
     rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB)
     chrom = _chromaticity_norm(rgb)
     h, w = chrom.shape[:2]
     wavelength_channel = np.full((h, w, 1), wavelength_value, dtype=np.float32)
-    x = np.concatenate([chrom, wavelength_channel], axis=2)
+    parts = [chrom, wavelength_channel]
+    if bayer_excess_tile is not None:
+        parts.append(bayer_excess_tile.astype(np.float32) / bayer_excess_scale)
+    x = np.concatenate(parts, axis=2)
     return np.transpose(x, (2, 0, 1)).copy()
 
 
@@ -290,6 +301,8 @@ def predict_frame(
     rig_prior_center: tuple[float, float] = DEFAULT_RIG_PRIOR_CENTER,
     rig_prior_sigma: tuple[float, float] = DEFAULT_RIG_PRIOR_SIGMA,
     rig_prior_floor: float = DEFAULT_RIG_PRIOR_FLOOR,
+    bayer_excess_image: np.ndarray | None = None,
+    bayer_excess_scale: float = 4096.0,
 ) -> FramePrediction:
     """Run tiled inference on a single 4K frame.
 
@@ -308,11 +321,25 @@ def predict_frame(
         else UNKNOWN_WAVELENGTH_CHANNEL
     )
 
+    bayer_padded: np.ndarray | None = None
+    if bayer_excess_image is not None:
+        bayer_padded = _reflect_pad(bayer_excess_image, grid.padded_h, grid.padded_w)
+
+    def _maybe_bayer_tile(x: int, y: int) -> np.ndarray | None:
+        if bayer_padded is None:
+            return None
+        return bayer_padded[y : y + tile, x : x + tile]
+
     tile_arrays = [
-        _preprocess_tile(padded[y : y + tile, x : x + tile], wavelength_value)
+        _preprocess_tile(
+            padded[y : y + tile, x : x + tile],
+            wavelength_value,
+            bayer_excess_tile=_maybe_bayer_tile(x, y),
+            bayer_excess_scale=bayer_excess_scale,
+        )
         for x, y in grid.origins
     ]
-    tile_batch = torch.from_numpy(np.stack(tile_arrays))  # [N, 4, H, W]
+    tile_batch = torch.from_numpy(np.stack(tile_arrays))  # [N, C, H, W]
 
     # Per-tile rig-prior mask (precomputed; same shape as the heatmap output).
     rig_masks: list[torch.Tensor] | None = None
@@ -412,6 +439,13 @@ def predict_frame_with_cascade(
     tau_line: float = 5.0,
     alpha_max: float = 0.3,
     refine_window: int = 256,
+    rig_prior: bool = False,
+    rig_prior_bbox: tuple[int, int, int, int] = DEFAULT_RIG_PRIOR_BBOX,
+    rig_prior_center: tuple[float, float] = DEFAULT_RIG_PRIOR_CENTER,
+    rig_prior_sigma: tuple[float, float] = DEFAULT_RIG_PRIOR_SIGMA,
+    rig_prior_floor: float = DEFAULT_RIG_PRIOR_FLOOR,
+    bayer_excess_image: np.ndarray | None = None,
+    bayer_excess_scale: float = 4096.0,
 ) -> FramePrediction:
     """Two-pass inference (Phase 5 cascade, DESIGN.md §9 followup).
 
@@ -437,6 +471,13 @@ def predict_frame_with_cascade(
         presence_threshold=presence_threshold,
         autocast_dtype=autocast_dtype,
         line_abc=None, line_confidence=0.0,  # snap only after refinement
+        rig_prior=rig_prior,
+        rig_prior_bbox=rig_prior_bbox,
+        rig_prior_center=rig_prior_center,
+        rig_prior_sigma=rig_prior_sigma,
+        rig_prior_floor=rig_prior_floor,
+        bayer_excess_image=bayer_excess_image,
+        bayer_excess_scale=bayer_excess_scale,
     )
     if coarse.pred_x is None or coarse.pred_y is None:
         return coarse
@@ -456,12 +497,21 @@ def predict_frame_with_cascade(
     crop = image_bgr[y0:y1, x0:x1]
     crop = _reflect_pad(crop, refine_window, refine_window)
 
+    bayer_crop: np.ndarray | None = None
+    if bayer_excess_image is not None:
+        bayer_crop = bayer_excess_image[y0:y1, x0:x1]
+        bayer_crop = _reflect_pad(bayer_crop, refine_window, refine_window)
+
     wavelength_value = (
         WAVELENGTH_CHANNEL.get(wavelength, UNKNOWN_WAVELENGTH_CHANNEL)
         if wavelength is not None
         else UNKNOWN_WAVELENGTH_CHANNEL
     )
-    arr = _preprocess_tile(crop, wavelength_value)
+    arr = _preprocess_tile(
+        crop, wavelength_value,
+        bayer_excess_tile=bayer_crop,
+        bayer_excess_scale=bayer_excess_scale,
+    )
     batch = torch.from_numpy(arr[None]).to(device, non_blocking=True)
 
     autocast_ctx = (

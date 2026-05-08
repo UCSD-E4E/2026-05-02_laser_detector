@@ -53,6 +53,87 @@ def _decode_with_fishsense_core(path: Path) -> np.ndarray | None:
         return None
 
 
+def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
+    """Decode an ORF and compute (G_excess, R_excess) channels at full resolution.
+
+    Each photosite in the Bayer mosaic sees only a single wavelength band. A
+    green laser saturates the G photosites first while leaving R/B headroom;
+    a red laser saturates R first. Computing per-2x2-cell:
+
+        G_avg    = (G1 + G2) / 2
+        G_excess = max(0, G_avg - max(R, B))     # "this 2x2 cell is green-bright"
+        R_excess = max(0, R     - max(G_avg, B)) # "this 2x2 cell is red-bright"
+
+    gives wavelength-discriminative features that survive demosaicing +
+    chromaticity normalization (which both wash this signal out). Black levels
+    are subtracted before the comparison.
+
+    Returns uint16 `[H, W, 2]` with channels (G_excess, R_excess) at the
+    original frame resolution. The half-res excess values are tiled 2x2 to
+    full res for direct compatibility with the existing tile pipeline.
+    """
+    import rawpy  # noqa: PLC0415
+
+    try:
+        with rawpy.imread(str(path)) as raw:
+            mosaic = raw.raw_image_visible.copy()
+            pattern = np.asarray(raw.raw_pattern)  # 2x2 indices
+            color_desc = raw.color_desc.decode()    # e.g. "RGBG"
+            black = list(raw.black_level_per_channel)  # 4 ints
+    except Exception as exc:
+        logger.warning("rawpy bayer decode failed for %s: %s", path, exc)
+        return None
+
+    if mosaic.ndim != 2:
+        logger.warning("unexpected raw_image_visible shape %s for %s", mosaic.shape, path)
+        return None
+    H, W = mosaic.shape
+
+    # Map each 2x2 offset to its color name ('R'/'G'/'B').
+    color_at: dict[tuple[int, int], str] = {}
+    for di in range(2):
+        for dj in range(2):
+            color_at[(di, dj)] = color_desc[int(pattern[di, dj])]
+
+    r_offsets = [(di, dj) for (di, dj), c in color_at.items() if c == "R"]
+    g_offsets = [(di, dj) for (di, dj), c in color_at.items() if c == "G"]
+    b_offsets = [(di, dj) for (di, dj), c in color_at.items() if c == "B"]
+    if len(r_offsets) != 1 or len(g_offsets) != 2 or len(b_offsets) != 1:
+        logger.warning(
+            "unexpected Bayer pattern (R=%s G=%s B=%s) for %s",
+            len(r_offsets), len(g_offsets), len(b_offsets), path,
+        )
+        return None
+
+    def _slice_at(off: tuple[int, int]) -> np.ndarray:
+        return mosaic[off[0]::2, off[1]::2]
+
+    # Black-level-correct each photosite plane with its per-channel offset.
+    # rawpy's black_level_per_channel ordering matches the pattern indices.
+    def _bl(off: tuple[int, int]) -> int:
+        idx = int(pattern[off[0], off[1]])
+        return int(black[idx]) if idx < len(black) else 0
+
+    r_arr = np.maximum(_slice_at(r_offsets[0]).astype(np.int32) - _bl(r_offsets[0]), 0)
+    b_arr = np.maximum(_slice_at(b_offsets[0]).astype(np.int32) - _bl(b_offsets[0]), 0)
+    g1 = np.maximum(_slice_at(g_offsets[0]).astype(np.int32) - _bl(g_offsets[0]), 0)
+    g2 = np.maximum(_slice_at(g_offsets[1]).astype(np.int32) - _bl(g_offsets[1]), 0)
+    g_avg = (g1 + g2) // 2
+
+    rb_max = np.maximum(r_arr, b_arr)
+    gb_max = np.maximum(g_avg, b_arr)
+    g_excess = np.maximum(g_avg - rb_max, 0).astype(np.uint16)
+    r_excess = np.maximum(r_arr - gb_max, 0).astype(np.uint16)
+
+    # Half-resolution → upsample 2x2 to match demosaiced cache shape.
+    half = np.stack([g_excess, r_excess], axis=2)  # [H/2, W/2, 2]
+    full = np.repeat(np.repeat(half, 2, axis=0), 2, axis=1)  # [H, W, 2]
+
+    # Trim/pad to the demosaiced visible size if odd-by-one.
+    full = full[:H, :W]
+    return full
+
+
 def _decode_raw_linear(path: Path) -> np.ndarray | None:
     """Decode a RAW file with rawpy directly: linear, 16-bit, no CLAHE.
 
@@ -242,6 +323,28 @@ class CachingLinearImageLoader:
         return image
 
 
+class LocalFilesystemBayerExcessLoader:
+    """Like LocalFilesystemImageLoader but computes Bayer-derived (G_excess,
+    R_excess) channels via `_decode_raw_bayer_excess`. Returns uint16 [H, W, 2].
+
+    Used as the inner of a CachingLinearNpyImageLoader. Non-RAW files load
+    nothing (returns None) — the Bayer features only make sense for RAW.
+    """
+
+    def __init__(self, root: Path | str):
+        self.root = Path(root)
+
+    def load(self, image_path: str, checksum: str) -> np.ndarray | None:
+        path = Path(image_path)
+        if not path.is_absolute():
+            path = self.root / path
+        if not path.exists():
+            return None
+        if path.suffix.lower() in RAW_EXTENSIONS:
+            return _decode_raw_bayer_excess(path)
+        return None
+
+
 class CachingLinearNpyImageLoader:
     """Decorator that caches uint16 BGR images as uncompressed `.npy` files.
 
@@ -316,6 +419,9 @@ def make_cached_image_loader(
     """
     if pipeline == "linear_npy":
         inner = LocalFilesystemLinearRawImageLoader(image_root)
+        return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
+    if pipeline == "bayer_excess":
+        inner = LocalFilesystemBayerExcessLoader(image_root)
         return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
     if pipeline == "linear":
         inner = LocalFilesystemLinearRawImageLoader(image_root)
