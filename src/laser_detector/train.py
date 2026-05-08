@@ -34,7 +34,11 @@ from laser_detector.data import (
     build_records,
 )
 from laser_detector.eval import PREDICTION_TABLE_SCHEMA, evaluate
-from laser_detector.inference import predict_frame, rig_prior_log_mask_batched
+from laser_detector.inference import (
+    predict_frame,
+    predict_frame_with_cascade,
+    rig_prior_log_mask_batched,
+)
 from laser_detector.model import (
     LaserDetector,
     bce_heatmap_loss,
@@ -117,12 +121,26 @@ class TrainConfig:
     # Gaussian floor inside the bbox. 1.0 = pure bbox (Gaussian disabled).
     # None falls back to inference.DEFAULT_RIG_PRIOR_FLOOR.
     inference_rig_prior_floor: float | None = None
+    # Gaussian σ override at inference. None → DEFAULT_RIG_PRIOR_SIGMA.
+    inference_rig_prior_sigma_x: float | None = None
+    inference_rig_prior_sigma_y: float | None = None
     # When True, the static rig-prior log-mask is added to heatmap logits
     # *during training* before BCE, so the model learns its outputs against
     # an inference-time consistent prior. Pairs with `inference_rig_prior`.
     train_rig_prior: bool = False
     # Floor for the training-time prior. None → DEFAULT_RIG_PRIOR_FLOOR.
     train_rig_prior_floor: float | None = None
+    # When True, val/eval inference uses `predict_frame_with_cascade` (Phase 5
+    # refinement crop) instead of the single-pass `predict_frame`.
+    inference_cascade: bool = False
+    # Refinement window size for cascade. None → predict_frame_with_cascade default.
+    inference_cascade_refine_window: int | None = None
+    # Number of input channels to LaserDetector. Default 4 (chrom + wavelength).
+    # 6 when bayer_excess channels are added.
+    in_channels: int = 4
+    # When True, the dataset loads a parallel Bayer-excess cache and appends
+    # (G_excess, R_excess) as channels 5 and 6. Pairs with in_channels=6.
+    use_bayer_excess: bool = False
 
 
 @dataclass
@@ -620,6 +638,7 @@ def _run_val_inference(
     device: torch.device,
     cfg: TrainConfig,
     ddp: DDPContext,
+    bayer_excess_loader: ImageLoader | None = None,
 ) -> pl.DataFrame:
     """Run tiled inference over every val frame; return predictions matching
     `PREDICTION_TABLE_SCHEMA`. With DDP active, each rank handles a stride
@@ -650,10 +669,29 @@ def _run_val_inference(
             else None
         )
         snap_line_conf = rec.line_confidence if snap_line_abc is not None else 0.0
-        rig_prior_kwargs = {"rig_prior": cfg.inference_rig_prior}
+        rig_prior_kwargs: dict = {"rig_prior": cfg.inference_rig_prior}
         if cfg.inference_rig_prior_floor is not None:
             rig_prior_kwargs["rig_prior_floor"] = cfg.inference_rig_prior_floor
-        pred = predict_frame(
+        if cfg.inference_rig_prior_sigma_x is not None and cfg.inference_rig_prior_sigma_y is not None:
+            rig_prior_kwargs["rig_prior_sigma"] = (
+                cfg.inference_rig_prior_sigma_x,
+                cfg.inference_rig_prior_sigma_y,
+            )
+        predict_fn = (
+            predict_frame_with_cascade if cfg.inference_cascade else predict_frame
+        )
+        cascade_kwargs: dict = {}
+        if cfg.inference_cascade and cfg.inference_cascade_refine_window is not None:
+            cascade_kwargs["refine_window"] = cfg.inference_cascade_refine_window
+        bayer_image = (
+            bayer_excess_loader.load(rec.image_path, rec.image_checksum)
+            if (cfg.use_bayer_excess and bayer_excess_loader is not None)
+            else None
+        )
+        bayer_kwargs: dict = {}
+        if bayer_image is not None:
+            bayer_kwargs["bayer_excess_image"] = bayer_image
+        pred = predict_fn(
             image_bgr, inference_model,
             wavelength=rec.wavelength,
             device=device,
@@ -663,6 +701,8 @@ def _run_val_inference(
             line_confidence=snap_line_conf,
             alpha_max=cfg.inference_soft_snap_alpha_max,
             **rig_prior_kwargs,
+            **cascade_kwargs,
+            **bayer_kwargs,
         )
         rows.append({
             "image_id": rec.image_id,
@@ -695,6 +735,7 @@ def train(
     wavelengths: pl.DataFrame,
     lines: pl.DataFrame,
     checkpoint_dir: Path,
+    bayer_excess_loader: ImageLoader | None = None,
     epoch_callback=None,
     step_callback=None,
     ddp: DDPContext | None = None,
@@ -725,12 +766,14 @@ def train(
     train_ds = LaserTileDataset(
         records=train_records, loader=image_loader, augment=True,
         linear_cache=cfg.linear_cache,
+        bayer_excess_loader=bayer_excess_loader if cfg.use_bayer_excess else None,
         seed=cfg.seed + ddp.rank,
     )
     # Single-process dataset used for scoring negatives between epochs.
     score_ds = LaserTileDataset(
         records=train_records, loader=image_loader, augment=False,
         linear_cache=cfg.linear_cache,
+        bayer_excess_loader=bayer_excess_loader if cfg.use_bayer_excess else None,
         seed=cfg.seed + 1 + ddp.rank,
     )
     sampler = HardNegativeBalancedSampler(
@@ -754,7 +797,7 @@ def train(
         pin_memory=device.type == "cuda",
     )
 
-    model = LaserDetector().to(device)
+    model = LaserDetector(in_channels=cfg.in_channels).to(device)
     if ddp.is_distributed:
         model = DistributedDataParallel(
             model, device_ids=[ddp.local_rank], output_device=ddp.local_rank,
@@ -850,6 +893,7 @@ def train(
         t1 = time.monotonic()
         predictions = _run_val_inference(
             model, epoch_val_records, image_loader, device, cfg, ddp,
+            bayer_excess_loader=bayer_excess_loader,
         )
         val_elapsed = time.monotonic() - t1
 
@@ -936,6 +980,7 @@ def train(
         t_final = time.monotonic()
         final_predictions = _run_val_inference(
             model, val_records, image_loader, device, cfg, ddp,
+            bayer_excess_loader=bayer_excess_loader,
         )
         if ddp.is_main:
             final_eval = evaluate(
