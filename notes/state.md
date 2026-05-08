@@ -2,6 +2,42 @@
 
 A quick reference for picking up tomorrow or after a server outage.
 
+## DO FIRST NEXT RUN: camera-coords refactor
+
+The current pipeline operates in **world coordinates** because rawpy's
+`postprocess` applies EXIF rotation by default — portrait-shot frames
+(~5% of the corpus, those with `raw.sizes.flip != 0`) have their cached
+image and labels in a different coordinate frame than landscape frames.
+
+This breaks the body-frame assumption behind the rig prior: the laser
+sits at a fixed location in *camera coordinates*, not world coordinates.
+Our empirical bbox/Gaussian is therefore the *union* of where the laser
+appears across both orientations (looser than it should be), and the
+5% portrait frames may have their lasers at a misaligned position
+relative to the prior.
+
+**Steps when picking this up:**
+
+1. Modify `_decode_raw_linear` to pass `user_flip=0` to `rawpy.postprocess`.
+2. Drop `_apply_rawpy_flip` from `_decode_raw_bayer_excess` (or skip it).
+3. Capture per-frame flip during cache rebuild (write to a sidecar
+   parquet keyed by `image_checksum`, or extend `frames.parquet`).
+4. In `build_records` (or `LaserTileDataset`), apply inverse rotation
+   to the labels using the per-frame flip so labels live in sensor
+   coordinates.
+5. Re-extract both caches — they're invalidated by the change. Plan ~6-8h.
+6. Re-derive `DEFAULT_RIG_PRIOR_BBOX`, `_CENTER`, `_SIGMA` from the new
+   sensor-coords histogram. Expect tighter values on both axes.
+7. `predict_frame` returns predictions in sensor coordinates; either
+   re-rotate to world for legacy reporting, or just keep sensor
+   coords (cleaner — both labels and preds are in the same frame).
+
+This was flagged 2026-05-08 morning while debugging a shape mismatch
+between the bayer cache and linear cache on portrait frames. The
+in-flight `b09egszzd` / `bq8ws67n2` runs trained on the world-coords
+caches; results are usable but the orientation cleanup should give
++1–3 pp on top.
+
 ## Where we are
 
 - **Phase 0**: refreshed 2026-05-04. 264 dives, 33,320 frames after
