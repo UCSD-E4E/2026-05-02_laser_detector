@@ -28,19 +28,23 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TILE_OVERLAP = 256
 
-# Static rig prior on laser position in original-frame pixels (4K canvas).
-# Empirically derived from all positive train labels (median ≈ (1977, 1342),
-# tight diagonal stripe around the vanishing point). The hard bbox is a
-# generous superset that survives slight rig changes; y_min=0 because the
-# laser can reach the top edge at effective distance. Within the bbox, a soft
-# Gaussian centered at the vanishing point biases argmax toward where the
-# laser is *most likely* to land. Outside the bbox → 0 (hard reject).
-DEFAULT_RIG_PRIOR_BBOX: tuple[int, int, int, int] = (1400, 0, 3000, 2200)
-DEFAULT_RIG_PRIOR_CENTER: tuple[float, float] = (1977.0, 1342.0)
-DEFAULT_RIG_PRIOR_SIGMA: tuple[float, float] = (200.0, 300.0)
-# Floor inside the bbox so a strong heatmap response in a low-prior region
-# isn't zeroed out — the prior nudges, doesn't overrule.
-DEFAULT_RIG_PRIOR_FLOOR: float = 0.1
+# Static rig prior on laser position in **sensor-coordinate** pixels of the
+# Olympus TG-6 (3016×4014). Derived from all positive train labels mapped
+# back into sensor coords via the orf_flip parquet: median ≈ (1977, 1343),
+# p99 box (1681–2643) × (987–1928), p1 (1).
+#
+# This was previously derived in world-coordinate space (post EXIF rotation),
+# which had to span both landscape and portrait laser positions and so was
+# noticeably looser on the y-axis. With sensor coords the rig is body-frame
+# stationary and the prior is correspondingly tighter.
+#
+# Outside the bbox → 0 (hard reject). Inside, a soft Gaussian biases argmax
+# toward the dense center, with a floor (default 0.5 from the world-coords
+# sweep) so a strong heatmap response in a low-prior region isn't crushed.
+DEFAULT_RIG_PRIOR_BBOX: tuple[int, int, int, int] = (1100, 700, 2950, 2180)
+DEFAULT_RIG_PRIOR_CENTER: tuple[float, float] = (1977.0, 1343.0)
+DEFAULT_RIG_PRIOR_SIGMA: tuple[float, float] = (300.0, 300.0)
+DEFAULT_RIG_PRIOR_FLOOR: float = 0.5
 
 
 def _rig_prior_for_tile(

@@ -29,10 +29,11 @@ from tqdm import tqdm
 from laser_detector.preprocessing.config import load_config
 from laser_detector.preprocessing.image_loader import (
     CachingLinearImageLoader,
+    CachingLinearNpyImageLoader,
     LocalFilesystemLinearRawImageLoader,
 )
 
-_WORKER_LOADER: CachingLinearImageLoader | None = None
+_WORKER_LOADER: CachingLinearImageLoader | CachingLinearNpyImageLoader | None = None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,13 +54,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cache-dir",
         type=Path,
         default=None,
-        help="Override cache dir. Default: <config.cache_dir>_linear",
+        help="Override cache dir. Default: <config.cache_dir>_linear (png) "
+        "or <config.cache_dir>_linear_npy (npy).",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("png", "npy"),
+        default="npy",
+        help="Cache file format. npy is uncompressed (~72 MB/frame, ~5x faster "
+        "decode at training time). png is compressed (~60 MB/frame, slower decode).",
     )
     parser.add_argument(
         "--png-compression",
         type=int,
         default=6,
         help="PNG compression level [0-9]; higher = smaller files, slower writes.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Worker count. Lower = gentler on system. 32 (config.image_workers) "
+        "thrashed the system on prior runs; 4 is the safe default.",
     )
     return parser.parse_args(argv)
 
@@ -92,13 +106,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    cache_dir = args.cache_dir or Path(f"{config.cache_dir}_linear")
-    inner = LocalFilesystemLinearRawImageLoader(config.image_root)
-    loader = CachingLinearImageLoader(
-        inner=inner,
-        cache_dir=cache_dir,
-        png_compression=args.png_compression,
-    )
+    if args.format == "npy":
+        cache_dir = args.cache_dir or Path(f"{config.cache_dir}_linear_npy")
+        inner = LocalFilesystemLinearRawImageLoader(config.image_root)
+        loader = CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
+    else:
+        cache_dir = args.cache_dir or Path(f"{config.cache_dir}_linear")
+        inner = LocalFilesystemLinearRawImageLoader(config.image_root)
+        loader = CachingLinearImageLoader(
+            inner=inner,
+            cache_dir=cache_dir,
+            png_compression=args.png_compression,
+        )
 
     frames = pl.read_parquet(config.data_dir / "frames.parquet")
     splits = pl.read_parquet(config.data_dir / "dive_splits.parquet")
@@ -121,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         len(target_dive_ids),
         list(args.splits),
         cache_dir,
-        config.image_workers,
+        args.workers,
     )
 
     counts: dict[str, int] = {"warm": 0, "decoded": 0, "failed": 0}

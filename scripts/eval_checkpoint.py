@@ -20,7 +20,7 @@ import mlflow
 import polars as pl
 import torch
 
-from laser_detector.data import build_records
+from laser_detector.data import build_records, load_orf_flip
 from laser_detector.eval import evaluate
 from laser_detector.model import LaserDetector
 from laser_detector.preprocessing.config import load_config
@@ -123,7 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         splits.filter(pl.col("split") == args.split)["dive_id"].unique().to_list()
     )
     split_frames = frames.filter(pl.col("dive_id").is_in(split_dive_ids))
-    records = build_records(split_frames, wavelengths, lines)
+    orf_flip = load_orf_flip(config.data_dir)
+    records = build_records(split_frames, wavelengths, lines, orf_flip=orf_flip)
     if ddp.is_main:
         logging.info(
             "Eval split=%s: %d dives, %d frames, ckpt=%s",

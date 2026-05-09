@@ -475,12 +475,63 @@ class HardNegativeBalancedSampler:
         self.neg_scores[arr] = max(float(score), 1e-3)
 
 
+def load_orf_flip(data_dir) -> pl.DataFrame | None:
+    """Load `data_dir / orf_flip.parquet` if present, else None.
+
+    Used to map labels (collected against rotated/world-coordinate views)
+    back into sensor coordinates so they align with the sensor-orientation
+    image cache. Returns None when the parquet doesn't exist (legacy data
+    paths) — callers fall through to world-coords behavior.
+    """
+    from pathlib import Path  # noqa: PLC0415
+    p = Path(data_dir) / "orf_flip.parquet"
+    if not p.exists():
+        return None
+    return pl.read_parquet(p)
+
+
+def _inverse_rotate_label(
+    label_x: float,
+    label_y: float,
+    flip: int,
+    sensor_h: int = 3016,
+    sensor_w: int = 4014,
+) -> tuple[float, float]:
+    """Map a label from world (post-EXIF-rotation) coords back into sensor coords.
+
+    Caches now hold images in sensor orientation (no EXIF rotation), so labels
+    collected against the rotated views must be mapped back. flip values per
+    libraw: 0 = no rotation, 3 = 180°, 5 = 90° CCW, 6 = 90° CW.
+
+    For flip=5 (rawpy applies np.rot90(k=1) → world shape becomes (W, H)):
+        sensor[r, c] → world[(W-1) - c, r]
+        inverse: given world (x_w, y_w), sensor (x_s, y_s) = (W-1 - y_w, x_w)
+    For flip=6 (rawpy applies np.rot90(k=3) → world shape becomes (W, H)):
+        sensor[r, c] → world[c, (H-1) - r]
+        inverse: world (x_w, y_w) → sensor (y_w, H-1 - x_w)
+    For flip=3 (180°):
+        inverse: (x_w, y_w) → (W-1 - x_w, H-1 - y_w)
+    """
+    if flip == 0:
+        return label_x, label_y
+    if flip == 3:
+        return sensor_w - 1 - label_x, sensor_h - 1 - label_y
+    if flip == 5:
+        return float(sensor_w - 1 - label_y), float(label_x)
+    if flip == 6:
+        return float(label_y), float(sensor_h - 1 - label_x)
+    return label_x, label_y
+
+
 def build_records(
     frames: pl.DataFrame,
     wavelengths: pl.DataFrame,
     lines: pl.DataFrame | None = None,
     *,
     drop_superseded: bool = True,
+    orf_flip: pl.DataFrame | None = None,
+    sensor_h: int = 3016,
+    sensor_w: int = 4014,
 ) -> list[FrameRecord]:
     """Join Phase 0 frames + wavelengths (+ optional lines) into per-frame records.
 
@@ -508,12 +559,27 @@ def build_records(
                          "line_confidence", "is_line_confident"),
             on="dive_id", how="left",
         )
+    if orf_flip is not None:
+        joined = joined.join(
+            orf_flip.select("image_checksum", "flip"),
+            on="image_checksum", how="left",
+        )
     records: list[FrameRecord] = []
     for row in joined.iter_rows(named=True):
         is_pos = bool(row["is_positive"])
-        label_xy = (
-            (float(row["label_x"]), float(row["label_y"])) if is_pos else None
-        )
+        if is_pos:
+            lx_world = float(row["label_x"])
+            ly_world = float(row["label_y"])
+            if orf_flip is not None and row.get("flip") is not None:
+                lx, ly = _inverse_rotate_label(
+                    lx_world, ly_world, int(row["flip"]),
+                    sensor_h=sensor_h, sensor_w=sensor_w,
+                )
+            else:
+                lx, ly = lx_world, ly_world
+            label_xy = (lx, ly)
+        else:
+            label_xy = None
         line_abc: tuple[float, float, float] | None = None
         line_conf = 0.0
         is_line_conf = False

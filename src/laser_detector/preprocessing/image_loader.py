@@ -53,6 +53,25 @@ def _decode_with_fishsense_core(path: Path) -> np.ndarray | None:
         return None
 
 
+def _apply_rawpy_flip(arr: np.ndarray, flip: int) -> np.ndarray:
+    """Apply rawpy/libraw EXIF rotation flag to a HxW or HxWxC array.
+
+    flip values per libraw: 0 no-op, 3 = 180°, 5 = 90° CCW, 6 = 90° CW.
+    `rawpy.postprocess` applies this automatically; our direct mosaic
+    extraction must replicate it to keep labels aligned across pipelines.
+    """
+    if flip == 0:
+        return arr
+    if flip == 3:
+        return np.rot90(arr, k=2)
+    if flip == 5:
+        return np.rot90(arr, k=1)
+    if flip == 6:
+        return np.rot90(arr, k=3)
+    logger.warning("unknown rawpy flip value %s; not rotating", flip)
+    return arr
+
+
 def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
     """Decode an ORF and compute (G_excess, R_excess) channels at full resolution.
 
@@ -80,6 +99,7 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
             pattern = np.asarray(raw.raw_pattern)  # 2x2 indices
             color_desc = raw.color_desc.decode()    # e.g. "RGBG"
             black = list(raw.black_level_per_channel)  # 4 ints
+            flip = int(raw.sizes.flip)
     except Exception as exc:
         logger.warning("rawpy bayer decode failed for %s: %s", path, exc)
         return None
@@ -131,17 +151,28 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
 
     # Trim/pad to the demosaiced visible size if odd-by-one.
     full = full[:H, :W]
+
+    # Both caches now operate in sensor coordinates (no rotation), so we don't
+    # apply the EXIF flip here. Labels get inverse-rotated into sensor coords
+    # via the per-frame `flip` lookup in build_records. `flip` is captured for
+    # callers that want to record per-frame rotation alongside the cache.
+    _ = flip  # explicit no-op to keep callers stable
     return full
 
 
 def _decode_raw_linear(path: Path) -> np.ndarray | None:
     """Decode a RAW file with rawpy directly: linear, 16-bit, no CLAHE.
 
-    Returns uint16 BGR (downstream OpenCV convention). Skips fishsense-core
-    on purpose: the project-standard pipeline applies CLAHE, which saturates
-    bright laser blobs across all channels and destroys wavelength selectivity
-    (see notes/state.md "Audit findings"). For laser detection we want the raw
-    sensor data while keeping demosaicing + camera white balance.
+    Returns uint16 BGR (downstream OpenCV convention) in **sensor coordinates**
+    (no EXIF rotation). The rig is a body-frame property — the laser sits at a
+    fixed location in the camera's coordinate frame. Operating in sensor
+    coordinates lets a single rig prior bbox/Gaussian apply uniformly across
+    all frames regardless of camera-body rotation.
+
+    Skips fishsense-core on purpose: the project-standard pipeline applies
+    CLAHE, which saturates bright laser blobs across all channels and destroys
+    wavelength selectivity. For laser detection we want raw sensor data with
+    demosaicing + camera white balance, but no rotation, no CLAHE.
     """
     import rawpy  # noqa: PLC0415 — lazy, big native library
 
@@ -153,6 +184,7 @@ def _decode_raw_linear(path: Path) -> np.ndarray | None:
                 no_auto_bright=True,           # don't auto-stretch the histogram
                 use_camera_wb=True,            # apply camera white balance
                 output_color=rawpy.ColorSpace.sRGB,
+                user_flip=0,                   # disable EXIF rotation (sensor coords)
             )
     except Exception as exc:
         logger.warning("rawpy linear decode failed for %s: %s", path, exc)

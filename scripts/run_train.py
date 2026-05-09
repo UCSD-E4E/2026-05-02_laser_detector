@@ -32,7 +32,7 @@ from pathlib import Path
 import mlflow
 import polars as pl
 
-from laser_detector.data import build_records
+from laser_detector.data import build_records, load_orf_flip
 from laser_detector.preprocessing.config import load_config
 from laser_detector.preprocessing.image_loader import (
     CachingImageLoader,
@@ -204,6 +204,7 @@ def _split_records(
     lines: pl.DataFrame | None,
     split: str,
     max_dives: int,
+    orf_flip: pl.DataFrame | None = None,
 ):
     dive_ids = (
         splits.filter(pl.col("split") == split)["dive_id"].unique().to_list()
@@ -211,7 +212,11 @@ def _split_records(
     if max_dives > 0:
         dive_ids = dive_ids[:max_dives]
     split_frames = frames.filter(pl.col("dive_id").is_in(dive_ids))
-    return build_records(split_frames, wavelengths, lines), dive_ids, split_frames.height
+    return (
+        build_records(split_frames, wavelengths, lines, orf_flip=orf_flip),
+        dive_ids,
+        split_frames.height,
+    )
 
 
 def _filter_loadable(
@@ -293,13 +298,18 @@ def main(argv: list[str] | None = None) -> int:
                 n_before - frames.height, frames.height, n_before,
             )
 
+    orf_flip = load_orf_flip(config.data_dir)
+    if ddp.is_main and orf_flip is not None:
+        logging.info("Loaded orf_flip parquet: %d rows", orf_flip.height)
     train_records, train_dives, n_train = _split_records(
         frames=frames, splits=splits, wavelengths=wavelengths, lines=lines,
         split="train", max_dives=args.max_train_dives,
+        orf_flip=orf_flip,
     )
     val_records, val_dives, n_val = _split_records(
         frames=frames, splits=splits, wavelengths=wavelengths, lines=lines,
         split="val", max_dives=args.max_val_dives,
+        orf_flip=orf_flip,
     )
     train_records, n_train_dropped = _filter_loadable(train_records, image_loader)
     val_records, n_val_dropped = _filter_loadable(val_records, image_loader)

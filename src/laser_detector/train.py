@@ -242,28 +242,32 @@ def _save_checkpoint(
     # restoring it on every rank would destroy that. Torch CPU RNG + numpy
     # RNG cover the correctness-critical determinism (sampler, augmentations).
     underlying = model.module if isinstance(model, DistributedDataParallel) else model
-    torch.save(
-        {
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_score": best_score,
-            "best_epoch": best_epoch,
-            "patience_counter": patience_counter,
-            "model_state_dict": underlying.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "sampler_state": {
-                "neg_scores": sampler.neg_scores,
-                "epoch": sampler._epoch,
-                "score_rng_state": sampler._score_rng.bit_generator.state,
-            },
-            "torch_rng_state": torch.get_rng_state(),
-            "numpy_rng_state": np.random.get_state(),
-            "metrics": metrics,
-            "cfg": cfg.__dict__,
+    state = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_score": best_score,
+        "best_epoch": best_epoch,
+        "patience_counter": patience_counter,
+        "model_state_dict": underlying.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "sampler_state": {
+            "neg_scores": sampler.neg_scores,
+            "epoch": sampler._epoch,
+            "score_rng_state": sampler._score_rng.bit_generator.state,
         },
-        path,
-    )
+        "torch_rng_state": torch.get_rng_state(),
+        "numpy_rng_state": np.random.get_state(),
+        "metrics": metrics,
+        "cfg": cfg.__dict__,
+    }
+    # Atomic write: save to <path>.tmp then rename. A kill mid-write leaves
+    # a .tmp file (cleaned up by callers / safely ignored by load) but never
+    # corrupts the eventual checkpoint. Without this, an interrupted save
+    # produces a truncated .pt that breaks `torch.load` on resume.
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp_path)
+    tmp_path.rename(path)
 
 
 def _load_checkpoint_for_resume(
