@@ -15,6 +15,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -187,7 +188,15 @@ def init_distributed() -> DDPContext:
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         world_size = int(os.environ["WORLD_SIZE"])
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+            # Default NCCL collective timeout is 10 min; raise to 60 min so val
+            # passes on the I/O-bound 6-ch linear+bayer cache don't trip the
+            # heartbeat watchdog on stragglers.
+            dist.init_process_group(
+                backend="nccl",
+                rank=rank,
+                world_size=world_size,
+                timeout=timedelta(minutes=60),
+            )
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
         return DDPContext(
@@ -590,17 +599,27 @@ def _benchmark_latency(
     image_loader: ImageLoader,
     device: torch.device,
     cfg: TrainConfig,
+    bayer_excess_loader: ImageLoader | None = None,
 ) -> dict[str, float]:
     """Time tiled-inference ms/frame at batch=1 and batch=8 per DESIGN.md §8.1.
 
     Skipped (returns {}) if we can't decode at least `warmup + measure` frames.
     """
     needed = cfg.latency_benchmark_warmup + cfg.latency_benchmark_frames
-    samples: list[tuple[FrameRecord, np.ndarray]] = []
+    # Each sample carries its optional Bayer-excess tile so a 6-channel model
+    # (cfg.use_bayer_excess) is fed the same inputs here as in val inference;
+    # without it predict_frame builds a 4-channel tile and conv1 mismatches.
+    samples: list[tuple[FrameRecord, np.ndarray, np.ndarray | None]] = []
     for rec in sample_records:
         img = image_loader.load(rec.image_path, rec.image_checksum)
-        if img is not None:
-            samples.append((rec, img))
+        if img is None:
+            continue
+        bayer_img = (
+            bayer_excess_loader.load(rec.image_path, rec.image_checksum)
+            if (cfg.use_bayer_excess and bayer_excess_loader is not None)
+            else None
+        )
+        samples.append((rec, img, bayer_img))
         if len(samples) >= needed:
             break
 
@@ -612,22 +631,27 @@ def _benchmark_latency(
 
     autocast_dtype = torch.bfloat16 if cfg.use_bf16 and device.type == "cuda" else None
     model.eval()
+
+    def _predict(rec, img, bayer_img, bs):
+        bayer_kwargs = (
+            {"bayer_excess_image": bayer_img} if bayer_img is not None else {}
+        )
+        predict_frame(
+            img, model, wavelength=rec.wavelength, device=device,
+            batch_size=bs, autocast_dtype=autocast_dtype,
+            **bayer_kwargs,
+        )
+
     metrics: dict[str, float] = {}
     for bs in (1, 8):
-        for rec, img in samples[: cfg.latency_benchmark_warmup]:
-            predict_frame(
-                img, model, wavelength=rec.wavelength, device=device,
-                batch_size=bs, autocast_dtype=autocast_dtype,
-            )
+        for rec, img, bayer_img in samples[: cfg.latency_benchmark_warmup]:
+            _predict(rec, img, bayer_img, bs)
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         measured = samples[cfg.latency_benchmark_warmup : needed]
-        for rec, img in measured:
-            predict_frame(
-                img, model, wavelength=rec.wavelength, device=device,
-                batch_size=bs, autocast_dtype=autocast_dtype,
-            )
+        for rec, img, bayer_img in measured:
+            _predict(rec, img, bayer_img, bs)
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
@@ -894,6 +918,24 @@ def train(
         )
         score_elapsed = time.monotonic() - t_score
 
+        # Safety net: save a "pre-val" checkpoint so a val-pass deadlock (e.g.
+        # NCCL collective timeout on I/O-bound stragglers) does not lose this
+        # epoch's training progress. Overwritten by the full save after val.
+        if ddp.is_main:
+            _save_checkpoint(
+                path=checkpoint_dir / f"epoch_{epoch:03d}.pt",
+                model=model, optimizer=optimizer, scheduler=scheduler,
+                sampler=sampler,
+                epoch=epoch, global_step=global_step,
+                best_score=best_score, best_epoch=artifacts.best_epoch,
+                patience_counter=patience_counter,
+                metrics={**{f"train_{k}": v for k, v in train_metrics.items()},
+                         "train_seconds": train_elapsed,
+                         "hard_negative_score_seconds": score_elapsed,
+                         "hard_negative_score_n": float(n_scored)},
+                cfg=cfg,
+            )
+
         t1 = time.monotonic()
         predictions = _run_val_inference(
             model, epoch_val_records, image_loader, device, cfg, ddp,
@@ -1013,7 +1055,7 @@ def train(
         )
         latency = _benchmark_latency(
             model=bench_model, sample_records=val_records, image_loader=image_loader,
-            device=device, cfg=cfg,
+            device=device, cfg=cfg, bayer_excess_loader=bayer_excess_loader,
         )
         artifacts.latency_metrics = latency
         if latency:
