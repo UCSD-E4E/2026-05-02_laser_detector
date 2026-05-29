@@ -131,21 +131,32 @@ def main(argv: list[str] | None = None) -> int:
             args.split, len(split_dive_ids), len(records), args.checkpoint,
         )
 
-    # Load checkpoint into a fresh model. The state_dict was saved unwrapped
-    # (rank-0 saves `model.module.state_dict()` when DDP-wrapped, per train.py).
+    # Load checkpoint, recover the saved TrainConfig FIRST, then build a model
+    # with the matching in_channels — so 4-ch JPEG and 6-ch sensor+Bayer
+    # checkpoints both load.
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = LaserDetector().to(ddp.device)
+    cfg = TrainConfig(**{k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__})
+    model = LaserDetector(in_channels=cfg.in_channels).to(ddp.device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     if ddp.is_main:
         logging.info(
-            "Loaded checkpoint (epoch=%d, train_loss=%.4f)",
-            ckpt.get("epoch", -1), ckpt.get("metrics", {}).get("train_loss", float("nan")),
+            "Loaded checkpoint (epoch=%d, train_loss=%.4f, in_channels=%d, bayer=%s)",
+            ckpt.get("epoch", -1),
+            ckpt.get("metrics", {}).get("train_loss", float("nan")),
+            cfg.in_channels, cfg.use_bayer_excess,
         )
 
-    cfg = TrainConfig(**{k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__})
-    # Override saved-cfg's soft-snap settings with the CLI flags so this
-    # script can A/B the same checkpoint with and without the snap.
+    # Parallel Bayer-excess cache loader when the checkpoint is 6-ch.
+    bayer_excess_loader = None
+    if cfg.use_bayer_excess:
+        bayer_cache_dir = Path(f"{config.cache_dir}_bayer_excess")
+        bayer_excess_loader = make_cached_image_loader(
+            config.image_root, bayer_cache_dir, pipeline="bayer_excess",
+        )
+
+    # Override saved-cfg's inference settings with the CLI flags so this
+    # script can A/B the same checkpoint with and without the snap/prior.
     cfg.inference_soft_snap = args.soft_snap_inference
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
     cfg.inference_rig_prior = args.rig_prior
@@ -156,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg.inference_cascade_refine_window = args.cascade_refine_window
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
+        bayer_excess_loader=bayer_excess_loader,
     )
 
     if not ddp.is_main:

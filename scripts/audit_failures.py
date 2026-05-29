@@ -292,14 +292,25 @@ def run_inference(
     orf_flip = load_orf_flip(config.data_dir)
     records = build_records(split_frames, wavelengths, lines, orf_flip=orf_flip)
 
+    # Load checkpoint, recover the saved TrainConfig FIRST, then build a model
+    # with the matching in_channels — so 4-ch JPEG and 6-ch sensor+Bayer
+    # checkpoints both load.
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = LaserDetector().to(ddp.device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
     cfg = TrainConfig(**{
         k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__
     })
+    model = LaserDetector(in_channels=cfg.in_channels).to(ddp.device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    # Parallel Bayer-excess cache loader when the checkpoint is 6-ch.
+    bayer_excess_loader = None
+    if cfg.use_bayer_excess:
+        bayer_cache_dir = Path(f"{config.cache_dir}_bayer_excess")
+        bayer_excess_loader = make_cached_image_loader(
+            config.image_root, bayer_cache_dir, pipeline="bayer_excess",
+        )
+
     cfg.inference_soft_snap = args.soft_snap_inference
     cfg.inference_soft_snap_alpha_max = args.soft_snap_alpha_max
     cfg.inference_rig_prior = args.rig_prior
@@ -311,6 +322,7 @@ def run_inference(
 
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
+        bayer_excess_loader=bayer_excess_loader,
     )
 
     if not ddp.is_main:
