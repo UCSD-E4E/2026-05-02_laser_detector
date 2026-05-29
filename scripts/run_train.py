@@ -193,6 +193,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override the bayer-excess cache dir. Default: <cache_dir>_bayer_excess.",
     )
+    parser.add_argument(
+        "--wavelength-balance",
+        action="store_true",
+        help="Inverse-frequency weight positive sampling by wavelength group "
+        "(red/green/None). Compensates for the ~4x red:green imbalance in v1 "
+        "and is the natural follow-up to the run3 audit, which showed a ~6 pp "
+        "dive-averaged green deficit on epoch_021.",
+    )
     return parser.parse_args(argv)
 
 
@@ -347,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         inference_rig_prior_floor=args.rig_prior_floor,
         use_bayer_excess=args.bayer_excess,
         in_channels=6 if args.bayer_excess else 4,
+        wavelength_balance=args.wavelength_balance,
     )
 
     resume_from: Path | None = None

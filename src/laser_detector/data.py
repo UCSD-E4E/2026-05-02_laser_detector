@@ -383,6 +383,7 @@ class HardNegativeBalancedSampler:
         *,
         rank: int = 0,
         world_size: int = 1,
+        wavelength_balance: bool = False,
     ):
         is_pos = np.array([r.label_xy is not None for r in records], dtype=bool)
         self.pos_indices = np.where(is_pos)[0]
@@ -396,6 +397,20 @@ class HardNegativeBalancedSampler:
             int(rec_idx): k for k, rec_idx in enumerate(self.neg_indices)
         }
         self.neg_scores = np.ones(len(self.neg_indices), dtype=np.float64)
+        # Optional inverse-frequency weighting of positives by wavelength group,
+        # to compensate for the green/red imbalance (red ~4× green in v1).
+        # Each wavelength's records get pooled weight 1.0; positives with no
+        # wavelength tag share the residual group so they aren't silenced.
+        self.pos_weights: np.ndarray | None = None
+        if wavelength_balance:
+            wls = [records[i].wavelength for i in self.pos_indices]
+            counts: dict[object, int] = {}
+            for w in wls:
+                counts[w] = counts.get(w, 0) + 1
+            w_per_record = np.array(
+                [1.0 / counts[w] for w in wls], dtype=np.float64
+            )
+            self.pos_weights = w_per_record / w_per_record.sum()
         self._base_seed = int(seed)
         # set_epoch updates this; without that call, every epoch would emit
         # the same shuffle. Trainer is expected to call set_epoch.
@@ -434,14 +449,21 @@ class HardNegativeBalancedSampler:
         rng = np.random.default_rng(self._base_seed + self._epoch)
         n = len(self.pos_indices)
         if len(self.neg_indices) > 0:
-            pos_sample = rng.choice(self.pos_indices, size=n, replace=True)
+            pos_sample = rng.choice(
+                self.pos_indices, size=n, replace=True, p=self.pos_weights,
+            )
             weights = self.neg_scores / self.neg_scores.sum()
             neg_sample = rng.choice(
                 self.neg_indices, size=n, replace=True, p=weights
             )
             idx = np.concatenate([pos_sample, neg_sample])
         else:
-            idx = rng.permutation(self.pos_indices)
+            if self.pos_weights is None:
+                idx = rng.permutation(self.pos_indices)
+            else:
+                idx = rng.choice(
+                    self.pos_indices, size=n, replace=True, p=self.pos_weights,
+                )
         rng.shuffle(idx)
         # Drop the last (len(idx) % world_size) entries so per-rank counts match.
         per_rank = len(idx) // self.world_size

@@ -142,6 +142,11 @@ class TrainConfig:
     # When True, the dataset loads a parallel Bayer-excess cache and appends
     # (G_excess, R_excess) as channels 5 and 6. Pairs with in_channels=6.
     use_bayer_excess: bool = False
+    # When True, the HardNegativeBalancedSampler weights positives inversely
+    # to their wavelength group size so the rarer green frames get oversampled.
+    # Addresses the dive-averaged green deficit seen in the failure audit on
+    # epoch_021 of the sensor 6-ch run3.
+    wavelength_balance: bool = False
 
 
 @dataclass
@@ -807,6 +812,7 @@ def train(
     sampler = HardNegativeBalancedSampler(
         train_records, seed=cfg.seed,
         rank=ddp.rank, world_size=ddp.world_size,
+        wavelength_balance=cfg.wavelength_balance,
     )
     if ddp.is_main:
         logger.info(
@@ -814,6 +820,17 @@ def train(
             len(sampler.pos_indices), len(sampler.neg_indices),
             len(sampler), ddp.world_size,
         )
+        if cfg.wavelength_balance:
+            # Tally positives by wavelength group so the log shows what the
+            # inverse-frequency reweighting is actually compensating for.
+            wl_counts: dict[object, int] = {}
+            for i in sampler.pos_indices:
+                w = train_records[int(i)].wavelength
+                wl_counts[w] = wl_counts.get(w, 0) + 1
+            logger.info(
+                "Wavelength-balanced sampling on; positive counts by wavelength: %s",
+                {str(k): v for k, v in sorted(wl_counts.items(), key=lambda kv: -kv[1])},
+            )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
