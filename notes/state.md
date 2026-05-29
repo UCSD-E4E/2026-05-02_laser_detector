@@ -1,42 +1,67 @@
-# Current state — 2026-05-06 afternoon
+# Current state — 2026-05-29 (post-run3)
 
 A quick reference for picking up tomorrow or after a server outage.
 
-## DO FIRST NEXT RUN: camera-coords refactor
+## Latest — run3 done; deployment recipe established
 
-The current pipeline operates in **world coordinates** because rawpy's
-`postprocess` applies EXIF rotation by default — portrait-shot frames
-(~5% of the corpus, those with `raw.sizes.flip != 0`) have their cached
-image and labels in a different coordinate frame than landscape frames.
+The camera-coords refactor is **DONE** (commit `cda6dc3` and the Bayer-excess
+and sensor-coords cache work that followed). The sensor-coords + Bayer-excess
+(linear cache, 6-channel) pipeline trained end-to-end through `run3` and
+early-stopped at epoch 31, best at epoch 21.
 
-This breaks the body-frame assumption behind the rig prior: the laser
-sits at a fixed location in *camera coordinates*, not world coordinates.
-Our empirical bbox/Gaussian is therefore the *union* of where the laser
-appears across both orientations (looser than it should be), and the
-5% portrait frames may have their lasers at a misaligned position
-relative to the prior.
+**New best checkpoint:**
+`data/phase2/checkpoints_sensor_bayer_50e_run3/epoch_021.pt`
 
-**Steps when picking this up:**
+Canonical full-val numbers (3625 frames, no inference flags):
 
-1. Modify `_decode_raw_linear` to pass `user_flip=0` to `rawpy.postprocess`.
-2. Drop `_apply_rawpy_flip` from `_decode_raw_bayer_excess` (or skip it).
-3. Capture per-frame flip during cache rebuild (write to a sidecar
-   parquet keyed by `image_checksum`, or extend `frames.parquet`).
-4. In `build_records` (or `LaserTileDataset`), apply inverse rotation
-   to the labels using the per-frame flip so labels live in sensor
-   coordinates.
-5. Re-extract both caches — they're invalidated by the change. Plan ~6-8h.
-6. Re-derive `DEFAULT_RIG_PRIOR_BBOX`, `_CENTER`, `_SIGMA` from the new
-   sensor-coords histogram. Expect tighter values on both axes.
-7. `predict_frame` returns predictions in sensor coordinates; either
-   re-rotate to world for legacy reporting, or just keep sensor
-   coords (cleaner — both labels and preds are in the same frame).
+| metric           | value |
+|------------------|-------|
+| hit_rate_n3      | 0.485 |
+| hit_rate_n4      | 0.717 |
+| presence_auroc   | 0.906 |
 
-This was flagged 2026-05-08 morning while debugging a shape mismatch
-between the bayer cache and linear cache on portrait frames. The
-in-flight `b09egszzd` / `bq8ws67n2` runs trained on the world-coords
-caches; results are usable but the orientation cleanup should give
-+1–3 pp on top.
+With the deployment inference recipe below: **hit_rate_n3 = 0.526** — +4.8 pp
+over the prior JPEG production peak (0.477), with bounded predictions.
+
+The structural green-vs-red wavelength gap that motivated the whole refactor
+is effectively **closed frame-weighted** (green ≈ 0.53, red ≈ 0.51) and
+reduced from Δ ≈ 0.27 to Δ ≈ 0.06 dive-averaged. Worst-dive (427, green)
+mean_err fell from ~829 px on the JPEG run to 234 px (3.5× better).
+
+Audit artifacts: `data/audit/epoch_021/{summary.png, plots/*.png,
+per_dive_metrics.parquet, wavelength_x_lineq.parquet, predictions_with_meta.parquet}`.
+
+## Deployment inference recipe — sensor 6-ch checkpoints
+
+For `epoch_021.pt` (and future sensor + Bayer-excess checkpoints):
+
+```bash
+uv run python scripts/eval_checkpoint.py \
+  --checkpoint <ckpt> --image-pipeline linear_npy \
+  --soft-snap-inference --rig-prior --cascade --rig-prior-floor 1.0
+```
+
+→ `hit_n3 = 0.5255, hit_n4 = 0.7498, mean_err = 28.9 px` (mean is bounded
+within the empirical laser bbox — no 1000-px catastrophic confusers).
+
+**Alternative** if precision (mean_err) matters more than hit rate:
+`--rig-prior-floor 0.0` (max Gaussian center bias) → `hit_n3 = 0.514`,
+`mean_err = 9.59 px`.
+
+**Individual flag contributions** (vs baseline 0.4850, full results in
+`data/phase2/checkpoints_sensor_bayer_50e_run3/ab_inference/` and `…/rig_floor_sweep/`):
+
+- `--cascade` (Phase 5 refinement crop): **+2.0 pp** — the heavy lifter,
+  directly attacks the bimodal catastrophic-confuser failure mode.
+- `--rig-prior`: −5.3 pp alone but **synergistic with cascade** (+2.7 pp
+  combined). The bbox clamps confusers globally; cascade then refines
+  locally to find the laser within bounds.
+- `--soft-snap-inference`: +0.2 pp solo. Essentially a no-op on this
+  checkpoint — the trained sensor-coords model relies on the per-dive line
+  prior less than the prior JPEG model did. Cheap to leave on.
+- `--rig-prior-floor 1.0` vs default `0.5`: **+1.3 pp** on top. The
+  Gaussian center bias was net-negative — it was quietly pulling correct
+  off-center predictions toward the empirical center. Pure bbox wins.
 
 ## Where we are
 
@@ -45,17 +70,22 @@ caches; results are usable but the orientation cleanup should give
   31,469). All `superseded=False` in the parquet because upstream
   filters server-side.
 - **Phase 1**: classical-CV baseline — done (commit `fc27aaa`).
-- **Phase 2**: BCE+pos_weight=1000 production run, 50 epochs, soft-snap
-  inference, no L_line. Early-stopped at epoch 17 (best=epoch 7).
-  **Best**: `checkpoints_bce_clean_50e/epoch_007.pt` →
-  `hit_rate_n3=0.477, hit_rate_n4=0.614, auroc=0.857, fpr=0.099`.
+- **Phase 2** (production training):
+  - JPEG 50e (2026-05-06): best `checkpoints_bce_clean_50e/epoch_007.pt` →
+    `hit_rate_n3=0.477` (per-epoch subsample).
+  - **Sensor 6-ch 50e (run3, 2026-05-28)**: best
+    `checkpoints_sensor_bayer_50e_run3/epoch_021.pt` → canonical full-val
+    `hit_n3=0.485` (no flags) / **0.526** (deployment recipe). Early-stopped
+    epoch 31. Wavelength gap closed frame-weighted. See "Latest" section.
 - **Phase 3**: code wired and committed. **L_line is harmful at every λ
   tested** (0.1 → 0.001 collapse, 0.01 → 0.000 collapse). Soft-snap
   inference *is* fine and gives +0.3pp on Phase 2's epoch_002 (0.383 →
   0.386). See memory `l_line_aux_loss_harmful.md`. L_line training term
   is shelved until we have a warm-start or windowed variant.
-- **Phase 4** (sweep): not started. Audit findings should drive sweep
-  axes — see "Next steps" below.
+- **Phase 4** (sweep): **inference-time** A/B done on run3 epoch_021 — see
+  "Latest" section and `data/phase2/.../ab_inference/` + `.../rig_floor_sweep/`.
+  Training-time sweep (`pos_weight`, `σ`, sampler weights) still pending;
+  audit pointed at wavelength-balanced sampling as the next target.
 - **Failure audit**: done. `scripts/audit_failures.py` produces
   per-dive metrics, wavelength × line-quartile crosstab, per-dive
   overlay plots, and a summary chart. Outputs in
@@ -67,12 +97,17 @@ Cleaned data, 4-GPU DDP, BCE+pos_weight=1000:
 
 | run | ckpt | hit_n3 | hit_n4 | AUROC | FPR | mean_err |
 | --- | --- | --- | --- | --- | --- | --- |
-| 50e (2026-05-06) | **epoch_007** | **0.477** | **0.614** | 0.857 | 0.099 | 265 |
-| 10e (2026-05-04) | epoch_002 | 0.383 | 0.540 | 0.854 | 0.146 | 281 |
+| Sensor 6-ch 50e (2026-05-28) | **epoch_021** (recipe) | **0.526** | **0.749** | 0.854 | — | 28.9 |
+| Sensor 6-ch 50e (2026-05-28) | epoch_021 (no flags) | 0.485 | 0.717 | 0.906 | 0.122 | ~70 |
+| JPEG 50e (2026-05-06)        | epoch_007             | 0.477   | 0.614 | 0.857 | 0.099 | 265 |
+| JPEG 10e (2026-05-04)        | epoch_002             | 0.383   | 0.540 | 0.854 | 0.146 | 281 |
 
-50-epoch run extended Phase 2 by 7 epochs of useful learning before
-val plateaued; +9.4 pp hit_n3 from the same recipe just running longer.
-Soft-snap inference enabled (caveat: see "Line-prior leakage" below).
+Sensor 6-ch numbers are canonical full-val (3625 frames); "recipe" row uses
+`--soft-snap-inference --rig-prior --cascade --rig-prior-floor 1.0` — see
+"Deployment inference recipe" above. Earlier JPEG numbers are per-epoch
+subsample, so the headline `0.526 > 0.477` is mildly favorable for run3
+(canonical-vs-subsample apples-to-oranges); a clean canonical comparison
+would need re-evaluating `epoch_007.pt` through the same path.
 
 Locations on the server (relative to repo root):
 
