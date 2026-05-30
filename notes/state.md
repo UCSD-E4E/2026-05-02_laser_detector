@@ -27,22 +27,35 @@ dive improves, aggregate lift on val = **+27.15 pp**. Wavelength-symmetric;
 a single global scalar pair suffices.
 
 End-to-end validation with `--pixel-bias-offset -1.13 -2.07` on run3
-epoch_021 + full deployment recipe:
+epoch_021 + full deployment recipe. **Both val (calibration source) and
+test (held-out generalization check) confirm the lift:**
 
-| metric              | baseline | + bias-offset |    Δ      |
-|---------------------|---------:|--------------:|----------:|
-| hit_rate_n3         |   0.5255 |    **0.7976** | **+27.21 pp** |
-| hit_rate_n4         |   0.7498 |    **0.8436** | +9.38 pp  |
-| median_pixel_error  |   2.05   |      **1.41** | −0.64     |
-| fraction_localized  |   0.9385 |      0.9385   | 0         |
+| split | metric              | baseline | + bias-offset |    Δ          |
+|-------|---------------------|---------:|--------------:|--------------:|
+| val   | hit_rate_n3         |   0.5255 |    **0.7976** | **+27.21 pp** |
+| val   | hit_rate_n4         |   0.7498 |    **0.8436** | +9.38 pp      |
+| val   | median_pixel_error  |   2.05   |      **1.41** | −0.64         |
+| val   | fraction_localized  |   0.9385 |      0.9385   | 0             |
+| test  | hit_rate_n3         |   0.5034 |    **0.8120** | **+30.86 pp** |
+| test  | hit_rate_n4         |   0.7627 |    **0.8583** | +9.56 pp      |
+| test  | median_pixel_error  |   2.99   |      **1.45** | −1.54         |
+| test  | fraction_localized  |   1.000  |      1.000    | 0             |
 
-The full scoreboard since project inception:
+Test beats val (0.812 vs 0.798) because test had no cache-miss frames (val
+pays a ~3 pp penalty for dive 249's 211 missing frames). Calibrated `(dx,
+dy)` was derived solely on val inliers and applied unchanged to test —
+**confirms the bias is an architectural property of the data pipeline,
+not a val-specific artifact**.
+
+The full scoreboard since project inception (val canonical):
 
 ```
 JPEG baseline ............. 0.477
 sensor 6-ch baseline ...... 0.485   (+0.008)
 + full deployment recipe .. 0.526   (+0.041)
 + pixel-bias-offset ....... 0.798   (+0.272)  ← single change, no retrain
+
+held-out test .............. 0.812  ← confirms generalization
 ```
 
 This single change is larger than every previous improvement combined and
