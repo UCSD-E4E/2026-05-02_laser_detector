@@ -14,7 +14,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -136,6 +136,15 @@ class TrainConfig:
     inference_cascade: bool = False
     # Refinement window size for cascade. None → predict_frame_with_cascade default.
     inference_cascade_refine_window: int | None = None
+    # Checkpoint-specific pixel-bias calibration. Subtracted from the final
+    # (pred_x, pred_y) before clamping. Defaults to no correction. Originates
+    # from the Bayer-excess upsample shift in preprocessing/image_loader.py
+    # (np.repeat puts each supercell value at the top-left of the 2×2 block
+    # rather than its centroid). Empirical value for the 6-ch run3 ckpt on val
+    # is approx (−1.13, −2.07); subtracting that lifts hit_n3 0.526 → 0.797
+    # (LOO-validated). Should be 0 for 4-ch JPEG checkpoints.
+    inference_pixel_bias_offset_x: float = 0.0
+    inference_pixel_bias_offset_y: float = 0.0
     # Number of input channels to LaserDetector. Default 4 (chrom + wavelength).
     # 6 when bayer_excess channels are added.
     in_channels: int = 4
@@ -737,6 +746,16 @@ def _run_val_inference(
             **cascade_kwargs,
             **bayer_kwargs,
         )
+        if pred.pred_x is not None and (
+            cfg.inference_pixel_bias_offset_x != 0.0
+            or cfg.inference_pixel_bias_offset_y != 0.0
+        ):
+            h, w = image_bgr.shape[:2]
+            px = pred.pred_x - cfg.inference_pixel_bias_offset_x
+            py = pred.pred_y - cfg.inference_pixel_bias_offset_y
+            px = max(0.0, min(px, float(w - 1)))
+            py = max(0.0, min(py, float(h - 1)))
+            pred = replace(pred, pred_x=px, pred_y=py)
         rows.append({
             "image_id": rec.image_id,
             "pred_x": pred.pred_x,

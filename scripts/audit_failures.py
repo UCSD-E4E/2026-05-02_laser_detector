@@ -76,6 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--cascade-refine-window", type=int, default=None)
     p.add_argument(
+        "--pixel-bias-offset", type=float, nargs=2, default=None, metavar=("DX", "DY"),
+        help="Subtract (dx, dy) px from each final pred to calibrate out the "
+        "Bayer-excess upsample bias (image_loader.py:148-150). "
+        "Empirical value for 6-ch run3 ckpt: -1.13 -2.07.",
+    )
+    p.add_argument(
         "--out-dir", type=Path, default=None,
         help="Default: data/audit/<checkpoint-stem>",
     )
@@ -319,6 +325,9 @@ def run_inference(
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
+    if args.pixel_bias_offset is not None:
+        cfg.inference_pixel_bias_offset_x = args.pixel_bias_offset[0]
+        cfg.inference_pixel_bias_offset_y = args.pixel_bias_offset[1]
 
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,

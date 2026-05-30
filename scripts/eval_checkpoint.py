@@ -76,6 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Cascade refinement window size. Default: predict_frame_with_cascade default.",
     )
     parser.add_argument(
+        "--pixel-bias-offset", type=float, nargs=2, default=None, metavar=("DX", "DY"),
+        help="Subtract (dx, dy) px from each final prediction. Calibrates out "
+        "the constant per-checkpoint bias from the Bayer-excess upsample shift "
+        "(image_loader.py:148-150). Use e.g. -1.13 -2.07 for the 6-ch run3 ckpt.",
+    )
+    parser.add_argument(
         "--no-mlflow", action="store_true",
         help="Skip MLflow logging; just print metrics.",
     )
@@ -165,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
+    if args.pixel_bias_offset is not None:
+        cfg.inference_pixel_bias_offset_x = args.pixel_bias_offset[0]
+        cfg.inference_pixel_bias_offset_y = args.pixel_bias_offset[1]
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
         bayer_excess_loader=bayer_excess_loader,

@@ -1,8 +1,88 @@
-# Current state — 2026-05-30 (post-wlbal experiment)
+# Current state — 2026-05-30 (post pixel-bias calibration)
 
 A quick reference for picking up tomorrow or after a server outage.
 
-## Latest — `--wavelength-balance` retrain DID NOT improve green; rolling back
+## Latest — found a 2-px systematic decode bias; calibrating it out lifts hit_n3 0.526 → 0.798
+
+After a step-back audit of the 47% miss population, the failure-mode
+stratification on `data/audit/epoch_021_recipe/predictions_with_meta.parquet`
+surfaced a **constant ~(−1.13, −2.07) px residual on correct (hit_n3=True)
+predictions**, essentially uniform across rigs (every rig 1/2/4/6/10 lands
+in dx ∈ [−1.07, −1.26], dy ∈ [−2.07, −2.25]) and wavelengths (red
+(−1.10, −2.12), green (−1.26, −1.89)). The bias was pushing ~1037 frames
+sitting in `border_3to5` past the 3-px threshold.
+
+Mechanism (smoking gun, [image_loader.py:148-150](src/laser_detector/preprocessing/image_loader.py#L148-L150)):
+the Bayer-excess channels are produced at half-res
+and upsampled with `np.repeat(np.repeat(half, 2, axis=0), 2, axis=1)`,
+which places each supercell value at the full-res top-left `(2i, 2j)`
+rather than its centroid `(2i+0.5, 2j+0.5)`. The 6-ch model fuses
+chromaticity (correctly aligned) with Bayer-excess (shifted +0.5 down-right)
+and learns a centroid pulled toward the shifted features. Sign matches;
+magnitude is amplified through the U-Net decoder. This is **specific to
+6-ch sensor+Bayer checkpoints**; 4-ch JPEG checkpoints should be exempt.
+
+LOO-cross-validated (derive bias from N−1 dives, apply to held-out): every
+dive improves, aggregate lift on val = **+27.15 pp**. Wavelength-symmetric;
+a single global scalar pair suffices.
+
+End-to-end validation with `--pixel-bias-offset -1.13 -2.07` on run3
+epoch_021 + full deployment recipe:
+
+| metric              | baseline | + bias-offset |    Δ      |
+|---------------------|---------:|--------------:|----------:|
+| hit_rate_n3         |   0.5255 |    **0.7976** | **+27.21 pp** |
+| hit_rate_n4         |   0.7498 |    **0.8436** | +9.38 pp  |
+| median_pixel_error  |   2.05   |      **1.41** | −0.64     |
+| fraction_localized  |   0.9385 |      0.9385   | 0         |
+
+The full scoreboard since project inception:
+
+```
+JPEG baseline ............. 0.477
+sensor 6-ch baseline ...... 0.485   (+0.008)
++ full deployment recipe .. 0.526   (+0.041)
++ pixel-bias-offset ....... 0.798   (+0.272)  ← single change, no retrain
+```
+
+This single change is larger than every previous improvement combined and
+makes the prior chase for a wavelength-fix moot (post-correction, red 0.802
+vs green 0.776 — gap closed and slightly inverted).
+
+**Production now:** `run3/epoch_021.pt` with the deployment recipe
+**AND** `--pixel-bias-offset -1.13 -2.07`.
+
+**Open follow-ups (blocked on NAS being back):**
+1. **Proper fix:** patch `_decode_raw_bayer_excess` to use centered bilinear
+   upsampling (or post-shift by −0.5 px), rebuild bayer_excess cache, and
+   retrain. The retrained model may or may not surface additional headroom
+   beyond the calibration constant — worth measuring.
+2. **Dive 249 prewarm:** 211/283 of dive 249's val frames have no cache
+   (linear_npy AND bayer_excess), so they were silently sentineled as null
+   preds in eval. Independent of bias: prewarming them yields +3 pp on the
+   canonical metric. Needs ORF decode → needs NAS.
+
+**Other notes from the strategy audit (not pursued for now):**
+- Per-dive RANSAC line-snap re-scoring was prototyped offline
+  (`scripts/prototype/colinearity_rescore.py`); does not help because 87%
+  of misses are *along-track* wrong-target picks, not perpendicular drift.
+  Would need top-K heatmap peaks emitted by the detector to matter.
+- DSNT/subpixel regression, focal loss, temporal: all explicitly rejected
+  in DESIGN.md (covered in the strategy review).
+- HRNet, σ-per-wavelength sweep, parabolic peak refinement: Phase 4/5
+  followups in DESIGN.md, not yet exercised. Parabolic peak refinement in
+  particular was flagged as "cheap, may close 1–2 px of the gap" — now
+  largely closed by this calibration, but still worth measuring after the
+  proper Bayer-excess fix retrain to see if there's residual headroom.
+
+Audit artifacts:
+- `data/audit/epoch_021_recipe/stratification/` — per-axis failure
+  breakdowns, label-noise floor analysis, dive 108 deep-dive, dive 249
+  cache-coverage analysis.
+- `data/phase2/checkpoints_sensor_bayer_50e_run3/bias_calibration/eval_bias-1.13_-2.07.log` —
+  end-to-end validation run.
+
+## Previous — `--wavelength-balance` retrain DID NOT improve green; rolling back
 
 Tried `--wavelength-balance` (inverse-frequency reweighting of positives by
 wavelength group; commit `60a5788`). Run is at
