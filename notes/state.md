@@ -1,8 +1,63 @@
-# Current state — 2026-05-29 (post-run3)
+# Current state — 2026-05-30 (post-wlbal experiment)
 
 A quick reference for picking up tomorrow or after a server outage.
 
-## Latest — run3 done; deployment recipe established
+## Latest — `--wavelength-balance` retrain DID NOT improve green; rolling back
+
+Tried `--wavelength-balance` (inverse-frequency reweighting of positives by
+wavelength group; commit `60a5788`). Run is at
+`data/phase2/checkpoints_sensor_bayer_wlbal_50e/epoch_011.pt`. It hit the
+same subsample peak as run3 (0.5503) in *half* the epochs (11 vs 21), so the
+sampler accelerated convergence — but the per-wavelength audit (both with
+the deployment recipe, apples-to-apples) shows green REGRESSED:
+
+| frame-weighted hit_n3 | green | red  | Δ (red − green) |
+|-----------------------|-------|------|-----------------|
+| **run3 + recipe** *(deployment)*     | **0.529** | 0.563 | +0.034 |
+| wlbal + recipe                        | 0.387 | 0.606 | +0.219 |
+
+Overall canonical `hit_n3` for wlbal+recipe = 0.5366 vs run3+recipe 0.5255
+(+1.1 pp), but that gain came from red improving (+0.04) while green
+collapsed (−0.14) — masked by the ~4:1 red/green frame imbalance in val.
+Green q4 dropped 0.51 → 0.30 (q4 < q1 inversion — high line-confidence
+frames got worst), suggesting wlbal made the model *overconfidently wrong*
+on green at test time and soft-snap can't rescue (blend weight 1−pred_conf
+collapses when pred_conf is high). Likely overfit to the repeatedly-sampled
+green training examples.
+
+**Decision: production stays on `run3/epoch_021.pt` with the deployment
+recipe below.** wlbal artifacts kept for the record; not adopted.
+
+Audit artifacts for both:
+- `data/audit/epoch_021/` (run3 no-flags) and `data/audit/epoch_021_recipe/`
+  (run3 with recipe — added 2026-05-30 for the wlbal A/B).
+- `data/audit/epoch_011/` (wlbal with recipe).
+
+## Run3 baseline — deployment model
+
+The camera-coords refactor is **DONE** (commit `cda6dc3` and the Bayer-excess
+and sensor-coords cache work that followed). The sensor-coords + Bayer-excess
+(linear cache, 6-channel) pipeline trained end-to-end through `run3` and
+early-stopped at epoch 31, best at epoch 21.
+
+**Best checkpoint:**
+`data/phase2/checkpoints_sensor_bayer_50e_run3/epoch_021.pt`
+
+Canonical full-val numbers (3625 frames, no inference flags):
+
+| metric           | value |
+|------------------|-------|
+| hit_rate_n3      | 0.485 |
+| hit_rate_n4      | 0.717 |
+| presence_auroc   | 0.906 |
+
+With the deployment inference recipe below: **hit_rate_n3 = 0.526** — +4.8 pp
+over the prior JPEG production peak (0.477), with bounded predictions.
+
+The structural green-vs-red wavelength gap that motivated the whole refactor
+is effectively **closed frame-weighted** (green ≈ 0.53, red ≈ 0.51) and
+reduced from Δ ≈ 0.27 to Δ ≈ 0.06 dive-averaged. Worst-dive (427, green)
+mean_err fell from ~829 px on the JPEG run to 234 px (3.5× better).
 
 The camera-coords refactor is **DONE** (commit `cda6dc3` and the Bayer-excess
 and sensor-coords cache work that followed). The sensor-coords + Bayer-excess
