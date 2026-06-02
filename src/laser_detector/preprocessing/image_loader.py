@@ -145,9 +145,20 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
     g_excess = np.maximum(g_avg - rb_max, 0).astype(np.uint16)
     r_excess = np.maximum(r_arr - gb_max, 0).astype(np.uint16)
 
-    # Half-resolution → upsample 2x2 to match demosaiced cache shape.
+    # Half-resolution → upsample 2× to match demosaiced cache shape, using
+    # centered bilinear interpolation. Each supercell at half-res index (i, j)
+    # represents the 2×2 photosite region whose centroid sits at full-res
+    # (2i+0.5, 2j+0.5); cv2.resize INTER_LINEAR places the supercell value at
+    # that centroid (its pixel-coord convention is `src = (dst+0.5) * scale −
+    # 0.5`, centroid-aligned for scale=0.5). The previous `np.repeat(..., 2)`
+    # variant placed the supercell value at the block top-left (2i, 2j)
+    # instead — a +0.5 px shift — and caused a constant ~(−1.1, −2.1) px
+    # label-bias on the 6-ch sensor model (see DESIGN.md §10 Risks).
     half = np.stack([g_excess, r_excess], axis=2)  # [H/2, W/2, 2]
-    full = np.repeat(np.repeat(half, 2, axis=0), 2, axis=1)  # [H, W, 2]
+    half_h, half_w = half.shape[:2]
+    full = cv2.resize(
+        half, (half_w * 2, half_h * 2), interpolation=cv2.INTER_LINEAR
+    )
 
     # Trim/pad to the demosaiced visible size if odd-by-one.
     full = full[:H, :W]
