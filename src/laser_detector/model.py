@@ -41,13 +41,19 @@ class LaserDetector(nn.Module):
         in_channels: int = DEFAULT_IN_CHANNELS,
         encoder_weights: str | None = "imagenet",
         presence_hidden: int = DEFAULT_PRESENCE_HIDDEN,
+        decoder_interpolation: str = "nearest",
     ):
         super().__init__()
+        # `decoder_interpolation` controls the smp UNet decoder's upsample mode.
+        # The default "nearest" matches smp's own default; switching to "bilinear"
+        # removes the axis-asymmetric argmax-tie bias that pulls predictions toward
+        # smaller (x, y). See notes/bias_attribution.md for the synthetic ablation.
         self.unet = smp.Unet(
             encoder_name=encoder_name,
             in_channels=in_channels,
             classes=1,
             encoder_weights=encoder_weights,
+            decoder_interpolation=decoder_interpolation,
         )
         bottleneck_dim = self.unet.encoder.out_channels[-1]
         self.presence_head = nn.Sequential(

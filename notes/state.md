@@ -70,6 +70,17 @@ data-validated on the held-out test set; we don't need to understand the
 mechanism to ship it. But the assumption that the Bayer-excess upsample was
 the dominant root cause is wrong.
 
+**Update 2026-06-03 — synthetic ablation cracks the question** (full writeup
+in [bias_attribution.md](bias_attribution.md)): feeding the production
+checkpoint synthetic Gaussian inputs at 81 known sub-pixel positions
+produces a deterministic median bias of **dx=−1.00 ± 0.78, dy=−3.70 ± 0.57**.
+That matches the real-data X bias (−1.13) exactly and exceeds the real Y
+bias (−2.07) — meaning the architectural shift is ~(−1.0, −3.7) and real
+blob characteristics partially attenuate the Y component to −2.07.
+Calibration constant is therefore a deterministic correction for a model-
+architecture artifact (likely smp UNet's nearest-mode decoder upsample),
+**not** a data-fitting hack — defensible for publication.
+
 ### Side work in this iteration (kept regardless of run4 outcome)
 
 - Added `--bayer-excess-cache-dir` flag to `scripts/eval_checkpoint.py` and

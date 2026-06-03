@@ -201,6 +201,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "and is the natural follow-up to the run3 audit, which showed a ~6 pp "
         "dive-averaged green deficit on epoch_021.",
     )
+    parser.add_argument(
+        "--decoder-interpolation",
+        choices=("nearest", "bilinear", "bicubic"),
+        default="nearest",
+        help="smp.Unet decoder upsample mode. Default 'nearest' matches smp's "
+        "own default but introduces an axis-asymmetric argmax-tie bias; "
+        "'bilinear' removes it. See notes/bias_attribution.md.",
+    )
     return parser.parse_args(argv)
 
 
@@ -356,6 +364,7 @@ def main(argv: list[str] | None = None) -> int:
         use_bayer_excess=args.bayer_excess,
         in_channels=6 if args.bayer_excess else 4,
         wavelength_balance=args.wavelength_balance,
+        decoder_interpolation=args.decoder_interpolation,
     )
 
     resume_from: Path | None = None

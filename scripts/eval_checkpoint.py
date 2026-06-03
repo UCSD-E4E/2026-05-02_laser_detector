@@ -149,7 +149,10 @@ def main(argv: list[str] | None = None) -> int:
     # checkpoints both load.
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = TrainConfig(**{k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__})
-    model = LaserDetector(in_channels=cfg.in_channels).to(ddp.device)
+    model = LaserDetector(
+        in_channels=cfg.in_channels,
+        decoder_interpolation=cfg.decoder_interpolation,
+    ).to(ddp.device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     if ddp.is_main:

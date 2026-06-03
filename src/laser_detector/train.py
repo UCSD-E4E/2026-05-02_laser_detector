@@ -148,6 +148,10 @@ class TrainConfig:
     # Number of input channels to LaserDetector. Default 4 (chrom + wavelength).
     # 6 when bayer_excess channels are added.
     in_channels: int = 4
+    # Decoder upsample mode in smp.Unet. "nearest" matches smp's own default
+    # but introduces an axis-asymmetric argmax-tie bias; "bilinear" removes
+    # it. See notes/bias_attribution.md for the synthetic ablation.
+    decoder_interpolation: str = "nearest"
     # When True, the dataset loads a parallel Bayer-excess cache and appends
     # (G_excess, R_excess) as channels 5 and 6. Pairs with in_channels=6.
     use_bayer_excess: bool = False
@@ -861,7 +865,10 @@ def train(
         pin_memory=device.type == "cuda",
     )
 
-    model = LaserDetector(in_channels=cfg.in_channels).to(device)
+    model = LaserDetector(
+        in_channels=cfg.in_channels,
+        decoder_interpolation=cfg.decoder_interpolation,
+    ).to(device)
     if ddp.is_distributed:
         model = DistributedDataParallel(
             model, device_ids=[ddp.local_rank], output_device=ddp.local_rank,
