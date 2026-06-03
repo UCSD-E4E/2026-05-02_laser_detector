@@ -1,8 +1,99 @@
-# Current state — 2026-05-30 (post pixel-bias calibration)
+# Current state — 2026-06-03 (post run4 retrain — calibration retained, root cause still open)
 
 A quick reference for picking up tomorrow or after a server outage.
 
-## Latest — found a 2-px systematic decode bias; calibrating it out lifts hit_n3 0.526 → 0.798
+## Latest — run4_centered retrain did NOT eliminate the bias; production stays on run3 + calibration
+
+Hypothesis from 2026-05-30 was that the Bayer-excess upsample (`np.repeat` placing
+half-res values at full-res top-left instead of supercell centroid) was the
+sole/dominant source of the ~(−1.13, −2.07) px label-prediction bias. Tested
+end-to-end:
+
+1. Replaced `np.repeat` with `cv2.resize(..., INTER_LINEAR)` (commit `0dba88e`)
+   in `_decode_raw_bayer_excess` — centroid-aligned upsample.
+2. Rebuilt the bayer_excess cache at `data/image_cache_bayer_excess_centered/`
+   (33090 decoded, 230 expected stale-path failures matching the old cache exactly).
+3. Trained `run4_centered` from scratch (50 epochs target). Killed at epoch 37
+   (best epoch 19, subsample val_hit_n3 = 0.566). Patience > 10 with train_loss
+   still dropping (overfitting territory).
+4. Paired full eval on val + test, with and without `--pixel-bias-offset`:
+
+| split | metric          | run3 e021 no-bias | run3 e021 +bias | run4 e019 no-bias | run4 e019 +bias |
+|-------|-----------------|------------------:|----------------:|------------------:|----------------:|
+| val   | hit_rate_n3     |            0.5255 |          0.7976 |            0.5042 |          0.7777 |
+| val   | hit_rate_n4     |            0.7498 |          0.8436 |            0.7241 |          0.8276 |
+| val   | median_pix_err  |              2.05 |            1.41 |              2.88 |            1.45 |
+| test  | hit_rate_n3     |            0.5034 |          0.8120 |            0.4466 |          0.7973 |
+| test  | hit_rate_n4     |            0.7627 |          0.8583 |            0.7324 |          0.8321 |
+| test  | median_pix_err  |              2.99 |            1.45 |              3.15 |            1.43 |
+
+Key observations:
+- **The bias is still present in run4.** Same `(−1.13, −2.07)` calibration lifts
+  it by +27/+35 pp, identical magnitude to run3's lift — so the Bayer-excess
+  upsample shift was NOT the dominant cause (or possibly not a cause at all).
+- **Run4 is slightly worse than run3** across all configs (~1.5–2 pp behind on
+  hit_n3 with bias, up to −5.7 pp on test no-bias). Same architecture, similar
+  best-epoch, just slightly unluckier init or training noise.
+- Production stays on `run3/epoch_021.pt` + recipe + `--pixel-bias-offset -1.13 -2.07`.
+
+### Investigation: where IS the bias from?
+
+Eliminated:
+- Bayer-excess upsample shift (run4 falsified it).
+- Heatmap encode/decode origin mismatch (prior agent verified, encode + decode
+  both treat pixels as integer point-samples).
+- Tile-stitch off-by-half (`compute_tile_grid` uses integer origins; `local_x + ox`
+  is exact translation).
+- Audit-script coordinate transform (raw pass-through from inference).
+- Eval-rotation bug (`_inverse_rotate_label` mismatch) — affects only 15 val
+  frames with `flip != 0`, immaterial to the systemic bias.
+
+Partial explanation found:
+- **Annotator-vs-photometric-centroid offset**: on 200 val frames, the laser's
+  photometric centroid sits ~(+0.36, +0.41) px below-left of the click label.
+  Per-wavelength: red (+0.34, +0.36), green (+0.53, +0.58). This is ~25–30%
+  of the bias magnitude. If labels click the saturated core and the model
+  learns photometric centroid features, this is consistent with the sign.
+  But it doesn't explain the remaining ~75%.
+
+Still unexplained:
+- The dx:dy ratio is ~1:2 (Y bias is 2× X bias). Photometric offset is ~1:1.
+  Bayer-excess shift was ~1:1. Something Y-asymmetric is contributing the
+  bulk of the bias and we haven't identified it.
+- Candidates for next investigation if the calibration ever stops working:
+  rolling-shutter / chromatic aberration / chromaticity-norm interpolation
+  shift / per-rig optical center asymmetry / a hidden integer cast somewhere
+  in the heatmap path.
+
+**Practical takeaway**: the calibration constant is empirically correct and
+data-validated on the held-out test set; we don't need to understand the
+mechanism to ship it. But the assumption that the Bayer-excess upsample was
+the dominant root cause is wrong.
+
+### Side work in this iteration (kept regardless of run4 outcome)
+
+- Added `--bayer-excess-cache-dir` flag to `scripts/eval_checkpoint.py` and
+  `scripts/audit_failures.py` so the centered-cache experiments could be A/B'd
+  cleanly against the buggy-cache checkpoints.
+- Hardened `LocalFilesystem*Loader.load()` in `preprocessing/image_loader.py`
+  to catch `OSError` on `path.exists()` (e.g., expired Kerberos, FUSE crash,
+  stale path), log a warning, and return None — caller writes a null prediction
+  for the frame instead of crashing the whole eval. Fixes the eval-crash
+  encountered when the CIFS Kerberos ticket expired mid-run.
+
+### Open items
+
+- **DEPRECATED** — DESIGN.md §10 Risks entry "Bayer-excess upsample shift" now
+  partially wrong: the shift is real but is not the dominant bias source.
+  Worth updating when DESIGN.md gets its sensor-coord sync.
+- **Kerberos**: user action — run `kinit` whenever to refresh the NAS auth
+  ticket (yesterday's expired 06/02 00:57 PDT). Not blocking inference
+  (loader is now resilient) but blocks any new ORF decode (training/prewarm).
+- **Dive 249**: 211 frames have stale paths in `frames.parquet` upstream of
+  Phase 0; not fixable without re-ingesting or re-mapping. Caps val at 94%
+  fraction_localized. Test set unaffected.
+
+## Previous — found a 2-px systematic decode bias; calibrating it out lifts hit_n3 0.526 → 0.798
 
 After a step-back audit of the 47% miss population, the failure-mode
 stratification on `data/audit/epoch_021_recipe/predictions_with_meta.parquet`

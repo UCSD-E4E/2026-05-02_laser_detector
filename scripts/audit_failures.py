@@ -82,6 +82,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Empirical value for 6-ch run3 ckpt: -1.13 -2.07.",
     )
     p.add_argument(
+        "--bayer-excess-cache-dir", type=Path, default=None,
+        help="Override the bayer_excess cache dir for 6-ch checkpoints. "
+        "Default: <cache_dir>_bayer_excess. Use the centered cache "
+        "(data/image_cache_bayer_excess_centered) when auditing models "
+        "trained against it (run4+).",
+    )
+    p.add_argument(
         "--out-dir", type=Path, default=None,
         help="Default: data/audit/<checkpoint-stem>",
     )
@@ -312,7 +319,11 @@ def run_inference(
     # Parallel Bayer-excess cache loader when the checkpoint is 6-ch.
     bayer_excess_loader = None
     if cfg.use_bayer_excess:
-        bayer_cache_dir = Path(f"{config.cache_dir}_bayer_excess")
+        bayer_cache_dir = args.bayer_excess_cache_dir or Path(
+            f"{config.cache_dir}_bayer_excess"
+        )
+        if ddp.is_main:
+            logging.info("bayer_excess cache: %s", bayer_cache_dir)
         bayer_excess_loader = make_cached_image_loader(
             config.image_root, bayer_cache_dir, pipeline="bayer_excess",
         )

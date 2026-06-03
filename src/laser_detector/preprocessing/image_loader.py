@@ -219,7 +219,15 @@ class LocalFilesystemImageLoader:
         path = Path(image_path)
         if not path.is_absolute():
             path = self.root / path
-        if not path.exists():
+        try:
+            path_exists = path.exists()
+        except OSError as exc:
+            # NAS hiccups (stale path, expired Kerberos, FUSE crash, etc.) should
+            # not crash inference. The caller will treat None as "no image" and
+            # emit a null prediction for this frame.
+            logger.warning("path.exists() failed for %s: %s", path, exc)
+            return None
+        if not path_exists:
             return None
         if path.suffix.lower() in RAW_EXTENSIONS:
             return _decode_with_fishsense_core(path)
@@ -307,7 +315,15 @@ class LocalFilesystemLinearRawImageLoader:
         path = Path(image_path)
         if not path.is_absolute():
             path = self.root / path
-        if not path.exists():
+        try:
+            path_exists = path.exists()
+        except OSError as exc:
+            # NAS hiccups (stale path, expired Kerberos, FUSE crash, etc.) should
+            # not crash inference. The caller will treat None as "no image" and
+            # emit a null prediction for this frame.
+            logger.warning("path.exists() failed for %s: %s", path, exc)
+            return None
+        if not path_exists:
             return None
         if path.suffix.lower() in RAW_EXTENSIONS:
             return _decode_raw_linear(path)
@@ -381,7 +397,15 @@ class LocalFilesystemBayerExcessLoader:
         path = Path(image_path)
         if not path.is_absolute():
             path = self.root / path
-        if not path.exists():
+        try:
+            path_exists = path.exists()
+        except OSError as exc:
+            # NAS hiccups (stale path, expired Kerberos, FUSE crash, etc.) should
+            # not crash inference. The caller will treat None as "no image" and
+            # emit a null prediction for this frame.
+            logger.warning("path.exists() failed for %s: %s", path, exc)
+            return None
+        if not path_exists:
             return None
         if path.suffix.lower() in RAW_EXTENSIONS:
             return _decode_raw_bayer_excess(path)

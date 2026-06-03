@@ -95,6 +95,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cache-dir", type=Path, default=None,
         help="Override cache directory.",
     )
+    parser.add_argument(
+        "--bayer-excess-cache-dir", type=Path, default=None,
+        help="Override the bayer_excess cache dir for 6-ch checkpoints. "
+        "Default: <cache_dir>_bayer_excess. Use the centered cache "
+        "(data/image_cache_bayer_excess_centered) when evaluating models "
+        "trained against it (i.e., run4+).",
+    )
     return parser.parse_args(argv)
 
 
@@ -156,7 +163,11 @@ def main(argv: list[str] | None = None) -> int:
     # Parallel Bayer-excess cache loader when the checkpoint is 6-ch.
     bayer_excess_loader = None
     if cfg.use_bayer_excess:
-        bayer_cache_dir = Path(f"{config.cache_dir}_bayer_excess")
+        bayer_cache_dir = args.bayer_excess_cache_dir or Path(
+            f"{config.cache_dir}_bayer_excess"
+        )
+        if ddp.is_main:
+            logging.info("bayer_excess cache: %s", bayer_cache_dir)
         bayer_excess_loader = make_cached_image_loader(
             config.image_root, bayer_cache_dir, pipeline="bayer_excess",
         )
