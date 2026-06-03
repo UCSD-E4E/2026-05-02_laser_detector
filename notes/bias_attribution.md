@@ -209,6 +209,39 @@ n=3 but raise the median.
   same training data, different decoder choice. Auto-launches after the
   (D, E) eval pair completes.
 
+## Planned but not queued — `run6_split_bayer`
+
+The bayer_excess decode currently averages the two G photosites in each
+2×2 Bayer supercell into a single `g_avg` channel before computing
+`g_excess` and upsampling. In an RGGB pattern, G1 is at (row, col+1) and
+G2 at (row+1, col) — the anti-diagonal of the supercell. Their mean
+represents intensity at the supercell *centroid*, but their *difference*
+encodes sub-supercell direction:
+
+- `G1 > G2` → laser shifted toward (row, col+1) — up-right within supercell
+- `G1 < G2` → laser shifted toward (row+1, col) — down-left
+
+The anti-diagonal direction is not axis-aligned: it projects mostly onto
+Y in standard sensor orientation. **The current averaging step destroys
+roughly 0.7 px of Y-discriminative sub-pixel signal** — which is on the
+same order as the residual Y bias remaining after the bilinear fix.
+
+**Hypothesis**: keeping G1 and G2 as separate channels (or adding their
+difference as a third bayer_excess channel) preserves the anti-diagonal
+asymmetry signal and should reduce the Y bias further. Falsifiable on
+synthetic data with the same single-frame test we used for ablations A–E.
+
+**Cost if pursued**:
+- Modify `_decode_raw_bayer_excess` to output additional channel(s).
+- Rebuild bayer_excess cache (~2h, requires NAS access).
+- Retrain from scratch (~24h) — `run6_split_bayer`.
+- Update `in_channels` from 6 to 7 (with diff channel) or 8 (full split).
+
+**Not queued — pending run5 results.** If run5_bilinear already cleans up
+the residual Y bias on real data, run6 becomes a marginal-improvement
+ablation; if run5 leaves a meaningful Y residual, run6 is the next
+high-value retrain.
+
 ## Reproducer
 
 ```bash
