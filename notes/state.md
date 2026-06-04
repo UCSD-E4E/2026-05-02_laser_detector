@@ -1,8 +1,31 @@
-# Current state — 2026-06-03 (post run4 retrain — calibration retained, root cause still open)
+# Current state — 2026-06-03 → overnight 06-04 (run5_bilinear running; run6_bayer_diff queued behind kinit)
 
 A quick reference for picking up tomorrow or after a server outage.
 
-## Latest — run4_centered retrain did NOT eliminate the bias; production stays on run3 + calibration
+## Overnight (2026-06-03 evening → 2026-06-04 morning) — what's running
+
+**Active**: `run5_bilinear` training (centered bayer cache + bilinear decoder).
+- Currently in the patience-extension resume that landed a new best at epoch
+  11 (subsample 0.667 vs epoch 0's 0.598). Trainer will stop at epoch 21;
+  orchestrator (`/tmp/run5_orchestrator.py`, pid 2741955, detached) then
+  applies the (final − best) < 10 rule and relaunches if needed.
+- After patience-10 is satisfied, orchestrator auto-runs **full-val + test
+  eval (with and without bias offset)** on the best checkpoint. Results
+  land in `data/phase2/checkpoints_sensor_bayer_50e_run5_bilinear/final_eval/`.
+
+**Blocked on kinit**: `run6_bayer_diff` (G_diff = G1 − G2 anti-diagonal channel).
+- All code shipped in commit `4ff2545`. Smoke-tested model accepts 7-ch input.
+- Cache rebuild needs ORF decode → needs NAS → needs valid Kerberos.
+- **When you wake up**: `kinit`, verify `ls /home/$USER/mnt/fishsense_data/REEF/data/`
+  works, then `bash scripts/launch_run6_bayer_diff.sh` — detaches a chain
+  that does prewarm (~2h) → run6 train (~24h with early-stop-patience=10).
+
+**Chain of detached processes** (all PPID=1, all survive disconnect):
+1. run5 trainer (current epoch 11-21 resume)
+2. run5 orchestrator → patience-loop + full-val + test eval
+3. (manual after kinit) run6 prewarm → run6 trainer
+
+## Previous — run4_centered retrain did NOT eliminate the bias; production stays on run3 + calibration
 
 Hypothesis from 2026-05-30 was that the Bayer-excess upsample (`np.repeat` placing
 half-res values at full-res top-left instead of supercell centroid) was the
