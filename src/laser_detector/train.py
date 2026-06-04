@@ -155,6 +155,11 @@ class TrainConfig:
     # When True, the dataset loads a parallel Bayer-excess cache and appends
     # (G_excess, R_excess) as channels 5 and 6. Pairs with in_channels=6.
     use_bayer_excess: bool = False
+    # When True (in addition to use_bayer_excess), the Bayer-excess cache also
+    # includes a third channel G_diff = G1 − G2 (anti-diagonal sub-supercell
+    # asymmetry). Pairs with in_channels=7 and the "bayer_excess_diff"
+    # cache pipeline. See notes/bias_attribution.md.
+    bayer_diff_channel: bool = False
     # When True, the HardNegativeBalancedSampler weights positives inversely
     # to their wavelength group size so the rarer green frames get oversampled.
     # Addresses the dive-averaged green deficit seen in the failure audit on

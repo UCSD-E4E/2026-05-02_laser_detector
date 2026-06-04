@@ -209,6 +209,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "own default but introduces an axis-asymmetric argmax-tie bias; "
         "'bilinear' removes it. See notes/bias_attribution.md.",
     )
+    parser.add_argument(
+        "--bayer-diff-channel",
+        action="store_true",
+        help="Add a third Bayer-excess channel G_diff = G1 − G2 (anti-diagonal "
+        "sub-supercell asymmetry). Requires --bayer-excess and a prewarmed "
+        "'bayer_excess_diff' cache. Sets in_channels=7. See notes/bias_attribution.md.",
+    )
     return parser.parse_args(argv)
 
 
@@ -282,12 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     bayer_excess_loader = None
     if args.bayer_excess:
+        bayer_pipeline = "bayer_excess_diff" if args.bayer_diff_channel else "bayer_excess"
         bayer_cache_dir = args.bayer_excess_cache_dir or Path(
-            f"{config.cache_dir}_bayer_excess"
+            f"{config.cache_dir}_{bayer_pipeline}"
         )
         bayer_excess_loader = make_cached_image_loader(
             config.image_root, bayer_cache_dir,
-            pipeline="bayer_excess",
+            pipeline=bayer_pipeline,
         )
     if ddp.is_main:
         logging.info(
@@ -362,7 +370,12 @@ def main(argv: list[str] | None = None) -> int:
         inference_rig_prior=args.inference_rig_prior,
         inference_rig_prior_floor=args.rig_prior_floor,
         use_bayer_excess=args.bayer_excess,
-        in_channels=6 if args.bayer_excess else 4,
+        bayer_diff_channel=args.bayer_diff_channel,
+        in_channels=(
+            7 if (args.bayer_excess and args.bayer_diff_channel)
+            else 6 if args.bayer_excess
+            else 4
+        ),
         wavelength_balance=args.wavelength_balance,
         decoder_interpolation=args.decoder_interpolation,
     )

@@ -72,8 +72,10 @@ def _apply_rawpy_flip(arr: np.ndarray, flip: int) -> np.ndarray:
     return arr
 
 
-def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
-    """Decode an ORF and compute (G_excess, R_excess) channels at full resolution.
+def _decode_raw_bayer_excess(
+    path: Path, *, with_diff_channel: bool = False,
+) -> np.ndarray | None:
+    """Decode an ORF and compute (G_excess, R_excess[, G_diff]) channels at full resolution.
 
     Each photosite in the Bayer mosaic sees only a single wavelength band. A
     green laser saturates the G photosites first while leaving R/B headroom;
@@ -82,14 +84,19 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
         G_avg    = (G1 + G2) / 2
         G_excess = max(0, G_avg - max(R, B))     # "this 2x2 cell is green-bright"
         R_excess = max(0, R     - max(G_avg, B)) # "this 2x2 cell is red-bright"
+        G_diff   = G1 - G2                       # anti-diagonal asymmetry (optional)
 
     gives wavelength-discriminative features that survive demosaicing +
     chromaticity normalization (which both wash this signal out). Black levels
     are subtracted before the comparison.
 
-    Returns uint16 `[H, W, 2]` with channels (G_excess, R_excess) at the
-    original frame resolution. The half-res excess values are tiled 2x2 to
-    full res for direct compatibility with the existing tile pipeline.
+    Returns int16 `[H, W, 2 or 3]` channels at the original frame resolution.
+    When `with_diff_channel=True`, a third channel `G_diff = G1 − G2` is
+    appended; this captures the anti-diagonal sub-supercell asymmetry that
+    the G1/G2 averaging step otherwise destroys. In RGGB the G photosites
+    sit at supercell positions (0, 1) and (1, 0) — their difference encodes
+    sub-supercell direction (G1>G2 → laser shifted up-right, G1<G2 →
+    shifted down-left). See `notes/bias_attribution.md`.
     """
     import rawpy  # noqa: PLC0415
 
@@ -142,8 +149,6 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
 
     rb_max = np.maximum(r_arr, b_arr)
     gb_max = np.maximum(g_avg, b_arr)
-    g_excess = np.maximum(g_avg - rb_max, 0).astype(np.uint16)
-    r_excess = np.maximum(r_arr - gb_max, 0).astype(np.uint16)
 
     # Half-resolution → upsample 2× to match demosaiced cache shape, using
     # centered bilinear interpolation. Each supercell at half-res index (i, j)
@@ -154,7 +159,21 @@ def _decode_raw_bayer_excess(path: Path) -> np.ndarray | None:
     # variant placed the supercell value at the block top-left (2i, 2j)
     # instead — a +0.5 px shift — and caused a constant ~(−1.1, −2.1) px
     # label-bias on the 6-ch sensor model (see DESIGN.md §10 Risks).
-    half = np.stack([g_excess, r_excess], axis=2)  # [H/2, W/2, 2]
+    if with_diff_channel:
+        # G1 and G2 sit on the anti-diagonal of the supercell — their
+        # difference (signed) is the sub-supercell direction signal that
+        # `g_avg` averages away. Pack everything as int16 (signed, same
+        # storage size as uint16) so the diff fits cleanly. Existing
+        # 2-channel uint16 cache stays untouched.
+        g_excess = np.maximum(g_avg - rb_max, 0).astype(np.int16)
+        r_excess = np.maximum(r_arr - gb_max, 0).astype(np.int16)
+        g_diff = (g1 - g2).astype(np.int32)
+        g_diff = np.clip(g_diff, -32768, 32767).astype(np.int16)
+        half = np.stack([g_excess, r_excess, g_diff], axis=2)  # [H/2, W/2, 3] int16
+    else:
+        g_excess = np.maximum(g_avg - rb_max, 0).astype(np.uint16)
+        r_excess = np.maximum(r_arr - gb_max, 0).astype(np.uint16)
+        half = np.stack([g_excess, r_excess], axis=2)  # [H/2, W/2, 2] uint16
     half_h, half_w = half.shape[:2]
     full = cv2.resize(
         half, (half_w * 2, half_h * 2), interpolation=cv2.INTER_LINEAR
@@ -384,14 +403,18 @@ class CachingLinearImageLoader:
 
 class LocalFilesystemBayerExcessLoader:
     """Like LocalFilesystemImageLoader but computes Bayer-derived (G_excess,
-    R_excess) channels via `_decode_raw_bayer_excess`. Returns uint16 [H, W, 2].
+    R_excess) channels via `_decode_raw_bayer_excess`. Returns uint16 [H, W, 2]
+    by default, or int16 [H, W, 3] with `with_diff_channel=True` (adds
+    G_diff = G1 − G2 as a third channel to expose the anti-diagonal
+    sub-supercell asymmetry; see notes/bias_attribution.md).
 
     Used as the inner of a CachingLinearNpyImageLoader. Non-RAW files load
     nothing (returns None) — the Bayer features only make sense for RAW.
     """
 
-    def __init__(self, root: Path | str):
+    def __init__(self, root: Path | str, *, with_diff_channel: bool = False):
         self.root = Path(root)
+        self.with_diff_channel = with_diff_channel
 
     def load(self, image_path: str, checksum: str) -> np.ndarray | None:
         path = Path(image_path)
@@ -408,7 +431,9 @@ class LocalFilesystemBayerExcessLoader:
         if not path_exists:
             return None
         if path.suffix.lower() in RAW_EXTENSIONS:
-            return _decode_raw_bayer_excess(path)
+            return _decode_raw_bayer_excess(
+                path, with_diff_channel=self.with_diff_channel,
+            )
         return None
 
 
@@ -489,6 +514,13 @@ def make_cached_image_loader(
         return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
     if pipeline == "bayer_excess":
         inner = LocalFilesystemBayerExcessLoader(image_root)
+        return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
+    if pipeline == "bayer_excess_diff":
+        # Same as `bayer_excess` but with an extra G1−G2 anti-diagonal asymmetry
+        # channel. See `_decode_raw_bayer_excess` and notes/bias_attribution.md.
+        inner = LocalFilesystemBayerExcessLoader(
+            image_root, with_diff_channel=True,
+        )
         return CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
     if pipeline == "linear":
         inner = LocalFilesystemLinearRawImageLoader(image_root)

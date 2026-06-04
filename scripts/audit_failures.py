@@ -322,13 +322,17 @@ def run_inference(
     # Parallel Bayer-excess cache loader when the checkpoint is 6-ch.
     bayer_excess_loader = None
     if cfg.use_bayer_excess:
+        bayer_pipeline = (
+            "bayer_excess_diff" if getattr(cfg, "bayer_diff_channel", False)
+            else "bayer_excess"
+        )
         bayer_cache_dir = args.bayer_excess_cache_dir or Path(
-            f"{config.cache_dir}_bayer_excess"
+            f"{config.cache_dir}_{bayer_pipeline}"
         )
         if ddp.is_main:
-            logging.info("bayer_excess cache: %s", bayer_cache_dir)
+            logging.info("bayer_excess cache: %s (pipeline=%s)", bayer_cache_dir, bayer_pipeline)
         bayer_excess_loader = make_cached_image_loader(
-            config.image_root, bayer_cache_dir, pipeline="bayer_excess",
+            config.image_root, bayer_cache_dir, pipeline=bayer_pipeline,
         )
 
     cfg.inference_soft_snap = args.soft_snap_inference

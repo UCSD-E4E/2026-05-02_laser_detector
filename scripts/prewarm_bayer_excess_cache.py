@@ -58,6 +58,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Worker count. Lower = gentler on system; we hit thrashing at "
         "16 with the data processor running so 4 is the safe default.",
     )
+    parser.add_argument(
+        "--with-diff-channel",
+        action="store_true",
+        help="Decode and cache the G_diff = G1 − G2 anti-diagonal-asymmetry "
+        "channel in addition to (G_excess, R_excess). Cache becomes int16 "
+        "[H, W, 3] instead of uint16 [H, W, 2]. Default cache dir suffix "
+        "changes to `_bayer_excess_diff` so existing 2-channel caches stay "
+        "untouched. See notes/bias_attribution.md.",
+    )
     return parser.parse_args(argv)
 
 
@@ -89,8 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    cache_dir = args.cache_dir or Path(f"{config.cache_dir}_bayer_excess")
-    inner = LocalFilesystemBayerExcessLoader(config.image_root)
+    suffix = "_bayer_excess_diff" if args.with_diff_channel else "_bayer_excess"
+    cache_dir = args.cache_dir or Path(f"{config.cache_dir}{suffix}")
+    inner = LocalFilesystemBayerExcessLoader(
+        config.image_root, with_diff_channel=args.with_diff_channel,
+    )
     loader = CachingLinearNpyImageLoader(inner=inner, cache_dir=cache_dir)
 
     frames = pl.read_parquet(config.data_dir / "frames.parquet")
