@@ -10,16 +10,19 @@ RUN6_DIR=$REPO/data/phase2/checkpoints_sensor_bayer_50e_run6_bayer_diff
 cd "$REPO"
 
 echo "=== prewarm start $(date) pid=$$ ===" >> "$RUN6_DIR/chain.log"
+# The prewarm script returns 1 if any frame fails to decode, but ~230 expected
+# failures (dive 249 stale paths + 19 train misses) are normal. Use `|| true`
+# to keep the chain alive past `set -e`; check the "Done in" marker instead.
 uv run python scripts/prewarm_bayer_excess_cache.py \
   --splits train val test \
   --with-diff-channel \
   --cache-dir "$CACHE_DIR" \
   --workers 8 \
-  > "$CACHE_DIR/prewarm.log" 2>&1
+  > "$CACHE_DIR/prewarm.log" 2>&1 || true
 PREWARM_RC=$?
 echo "=== prewarm rc=$PREWARM_RC $(date) ===" >> "$RUN6_DIR/chain.log"
-if [ $PREWARM_RC -ne 0 ] && ! grep -q "Done in" "$CACHE_DIR/prewarm.log" 2>/dev/null; then
-  echo "=== prewarm did NOT complete cleanly; aborting run6 launch $(date) ===" >> "$RUN6_DIR/chain.log"
+if ! grep -q "Done in" "$CACHE_DIR/prewarm.log" 2>/dev/null; then
+  echo "=== prewarm did NOT complete cleanly (no 'Done in' marker); aborting $(date) ===" >> "$RUN6_DIR/chain.log"
   exit 1
 fi
 
