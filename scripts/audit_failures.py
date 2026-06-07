@@ -76,6 +76,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--cascade-refine-window", type=int, default=None)
     p.add_argument(
+        "--subpixel-refine", action="store_true",
+        help="Refine the heatmap argmax to sub-pixel via parabolic peak fit (Phase 2A).",
+    )
+    p.add_argument(
         "--pixel-bias-offset", type=float, nargs=2, default=None, metavar=("DX", "DY"),
         help="Subtract (dx, dy) px from each final pred to calibrate out the "
         "Bayer-excess upsample bias (image_loader.py:148-150). "
@@ -343,6 +347,7 @@ def run_inference(
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
+    cfg.inference_subpixel_refine = args.subpixel_refine
     if args.pixel_bias_offset is not None:
         cfg.inference_pixel_bias_offset_x = args.pixel_bias_offset[0]
         cfg.inference_pixel_bias_offset_y = args.pixel_bias_offset[1]

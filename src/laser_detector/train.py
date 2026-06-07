@@ -136,6 +136,10 @@ class TrainConfig:
     inference_cascade: bool = False
     # Refinement window size for cascade. None → predict_frame_with_cascade default.
     inference_cascade_refine_window: int | None = None
+    # When True, refine the heatmap argmax to sub-pixel via a 3-point parabolic
+    # peak fit on the cross neighborhood (see inference._subpixel_refine_peak).
+    # Phase 2A; Phase 1A showed ~63% of failures are 3-10 px borderline misses.
+    inference_subpixel_refine: bool = False
     # Checkpoint-specific pixel-bias calibration. Subtracted from the final
     # (pred_x, pred_y) before clamping. Defaults to no correction. Originates
     # from the Bayer-excess upsample shift in preprocessing/image_loader.py
@@ -751,6 +755,7 @@ def _run_val_inference(
             line_abc=snap_line_abc,
             line_confidence=snap_line_conf,
             alpha_max=cfg.inference_soft_snap_alpha_max,
+            subpixel_refine=cfg.inference_subpixel_refine,
             **rig_prior_kwargs,
             **cascade_kwargs,
             **bayer_kwargs,

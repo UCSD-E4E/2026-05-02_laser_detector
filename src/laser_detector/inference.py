@@ -187,6 +187,43 @@ def compute_tile_grid(
     )
 
 
+def _subpixel_refine_peak(
+    heatmap_2d: "torch.Tensor | np.ndarray", x: int, y: int
+) -> tuple[float, float]:
+    """Refine an integer-pixel peak `(x, y)` to sub-pixel via a separable
+    parabolic fit on the 3-point cross neighborhood. For each axis:
+
+        delta = 0.5 * (v_minus - v_plus) / (v_minus - 2*v_center + v_plus)
+
+    The denominator is positive when `(x, y)` is a real local maximum; the
+    shift is in `(-0.5, 0.5)`. Peaks on the heatmap edge, degenerate fits, or
+    shifts that escape `(-0.5, 0.5)` return the original integer (the parabola
+    assumption fails — typically because the integer pixel wasn't the true
+    local max). Accepts torch.Tensor or np.ndarray. O(5) tensor reads.
+    """
+    h, w = heatmap_2d.shape[-2:]
+    if x <= 0 or x >= w - 1 or y <= 0 or y >= h - 1:
+        return float(x), float(y)
+    if isinstance(heatmap_2d, torch.Tensor):
+        def get(i: int, j: int) -> float:
+            return float(heatmap_2d[i, j].item())
+    else:
+        def get(i: int, j: int) -> float:
+            return float(heatmap_2d[i, j])
+    v_c = get(y, x)
+    v_xm, v_xp = get(y, x - 1), get(y, x + 1)
+    v_ym, v_yp = get(y - 1, x), get(y + 1, x)
+    den_x = v_xm - 2.0 * v_c + v_xp
+    den_y = v_ym - 2.0 * v_c + v_yp
+    dx = 0.5 * (v_xm - v_xp) / den_x if abs(den_x) > 1e-12 else 0.0
+    dy = 0.5 * (v_ym - v_yp) / den_y if abs(den_y) > 1e-12 else 0.0
+    if not (-0.5 < dx < 0.5):
+        dx = 0.0
+    if not (-0.5 < dy < 0.5):
+        dy = 0.0
+    return float(x) + dx, float(y) + dy
+
+
 def _reflect_pad(image_bgr: np.ndarray, h: int, w: int) -> np.ndarray:
     """Pad to (h, w) with reflection if smaller; otherwise return as-is."""
     src_h, src_w = image_bgr.shape[:2]
@@ -307,6 +344,7 @@ def predict_frame(
     rig_prior_floor: float = DEFAULT_RIG_PRIOR_FLOOR,
     bayer_excess_image: np.ndarray | None = None,
     bayer_excess_scale: float = 4096.0,
+    subpixel_refine: bool = False,
 ) -> FramePrediction:
     """Run tiled inference on a single 4K frame.
 
@@ -361,6 +399,9 @@ def predict_frame(
 
     best_value = -1.0
     best_xy = (None, None)
+    best_local: tuple[int, int] | None = None
+    best_origin: tuple[int, int] | None = None
+    best_heatmap_2d: torch.Tensor | None = None  # winning tile, for sub-pixel refine
     presence_max = 0.0
 
     autocast_ctx = (
@@ -373,7 +414,8 @@ def predict_frame(
         chunk = tile_batch[chunk_start : chunk_start + batch_size].to(device, non_blocking=True)
         with autocast_ctx:
             out = model(chunk)
-        heatmap_probs = torch.sigmoid(out["heatmap_logits"]).float()
+        heatmap_logits = out["heatmap_logits"].float()  # full-precision copy for sub-pixel
+        heatmap_probs = torch.sigmoid(heatmap_logits)
         presence_probs = torch.sigmoid(out["presence_logits"]).float()
 
         if rig_masks is not None:
@@ -392,6 +434,16 @@ def predict_frame(
                 local_y, local_x = divmod(mi, tile)
                 ox, oy = grid.origins[chunk_start + i]
                 best_xy = (float(local_x + ox), float(local_y + oy))
+                best_local = (local_x, local_y)
+                best_origin = (ox, oy)
+                if subpixel_refine:
+                    # Refine on LOGITS, not probs: under bf16 autocast, sigmoid
+                    # saturates to 1.0 at the peak and the 3-point cross can't
+                    # distinguish "true peak" from "neighbor +1 step". Logits
+                    # keep dynamic range and give the same parabolic peak
+                    # (sigmoid is monotonic). Detach to CPU so the GPU tile
+                    # tensor can be freed when the next chunk loads.
+                    best_heatmap_2d = heatmap_logits[i, 0].detach().cpu()
         presence_max = max(presence_max, float(presence_probs.max().item()))
 
     if presence_threshold is not None and presence_max < presence_threshold:
@@ -399,6 +451,11 @@ def predict_frame(
 
     pred_x, pred_y = best_xy
     if pred_x is not None:
+        if subpixel_refine and best_heatmap_2d is not None and best_local is not None and best_origin is not None:
+            local_x, local_y = best_local
+            rx, ry = _subpixel_refine_peak(best_heatmap_2d, local_x, local_y)
+            pred_x = float(best_origin[0]) + rx
+            pred_y = float(best_origin[1]) + ry
         # Don't report predictions inside the reflect-padded margin.
         pred_x = min(pred_x, float(grid.original_w - 1))
         pred_y = min(pred_y, float(grid.original_h - 1))
@@ -450,6 +507,7 @@ def predict_frame_with_cascade(
     rig_prior_floor: float = DEFAULT_RIG_PRIOR_FLOOR,
     bayer_excess_image: np.ndarray | None = None,
     bayer_excess_scale: float = 4096.0,
+    subpixel_refine: bool = False,
 ) -> FramePrediction:
     """Two-pass inference (Phase 5 cascade, DESIGN.md §9 followup).
 
@@ -482,6 +540,9 @@ def predict_frame_with_cascade(
         rig_prior_floor=rig_prior_floor,
         bayer_excess_image=bayer_excess_image,
         bayer_excess_scale=bayer_excess_scale,
+        subpixel_refine=subpixel_refine,  # so the fallback-to-coarse path
+        # (pass-2 rejected by presence or confidence-drop check below) still
+        # benefits from sub-pixel; cropping uses int(round(...)) regardless.
     )
     if coarse.pred_x is None or coarse.pred_y is None:
         return coarse
@@ -525,15 +586,22 @@ def predict_frame_with_cascade(
     )
     with autocast_ctx:
         out = model(batch)
-    heatmap_probs = torch.sigmoid(out["heatmap_logits"][0]).float()
+    heatmap_logits = out["heatmap_logits"][0].float()  # full precision for sub-pixel
+    heatmap_probs = torch.sigmoid(heatmap_logits)
     presence_prob = float(torch.sigmoid(out["presence_logits"][0]).max().item())
 
     flat = heatmap_probs.view(-1)
     refined_idx = int(flat.argmax().item())
     refined_value = float(flat.max().item())
     local_y, local_x = divmod(refined_idx, refine_window)
-    refined_x = float(x0 + local_x)
-    refined_y = float(y0 + local_y)
+    if subpixel_refine:
+        # Refine on logits (bf16-stable) — see predict_frame for the rationale.
+        rx, ry = _subpixel_refine_peak(heatmap_logits[0], local_x, local_y)
+        refined_x = float(x0) + rx
+        refined_y = float(y0) + ry
+    else:
+        refined_x = float(x0 + local_x)
+        refined_y = float(y0 + local_y)
 
     # Only accept the refinement if the local heatmap actually has a peak; if
     # presence drops below threshold or the local peak is much weaker than
