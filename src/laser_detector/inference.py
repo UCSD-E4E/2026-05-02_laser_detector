@@ -187,6 +187,39 @@ def compute_tile_grid(
     )
 
 
+def _line_mask_for_tile(
+    tile_origin_x: int,
+    tile_origin_y: int,
+    tile: int,
+    line_abc: tuple[float, float, float],
+    corridor_px: float,
+) -> np.ndarray:
+    """Build a `[tile, tile]` float32 binary mask for a single tile that is
+    1.0 where the pixel is within `corridor_px` of the dive line `a*x + b*y +
+    c = 0` and 0.0 otherwise.
+
+    Phase 3.1: per-dive geometric constraint, much tighter than the rig-prior
+    bbox. Population val/test label-to-line p99 is ≤ 13 px; a ±25 corridor
+    safely includes essentially all real labels while killing distractors
+    living far from the line (val:427 distractor cluster is 203 px off-line).
+
+    `line_abc` is `(a, b, c)` from `dive_lines.parquet`; (a, b) is unit-
+    normalized in the Phase 0 fit so `|a*x + b*y + c|` is already the
+    perpendicular distance. Falls back to the general formula if not unit
+    (cheap and bullet-proof).
+    """
+    a, b, c = line_abc
+    norm = float((a * a + b * b) ** 0.5)
+    if norm <= 1e-12:
+        return np.ones((tile, tile), dtype=np.float32)
+    ys, xs = np.mgrid[
+        tile_origin_y : tile_origin_y + tile,
+        tile_origin_x : tile_origin_x + tile,
+    ].astype(np.float32)
+    dist = np.abs(a * xs + b * ys + c) / norm
+    return (dist <= corridor_px).astype(np.float32)
+
+
 def _subpixel_refine_peak(
     heatmap_2d: "torch.Tensor | np.ndarray", x: int, y: int
 ) -> tuple[float, float]:
@@ -345,6 +378,7 @@ def predict_frame(
     bayer_excess_image: np.ndarray | None = None,
     bayer_excess_scale: float = 4096.0,
     subpixel_refine: bool = False,
+    line_mask_corridor_px: float | None = None,
 ) -> FramePrediction:
     """Run tiled inference on a single 4K frame.
 
@@ -397,6 +431,19 @@ def predict_frame(
             for (ox, oy) in grid.origins
         ]
 
+    # Per-tile line-corridor mask (when caller provides line_abc + corridor).
+    # Multiplies the rig prior; zeros pixels farther than corridor_px from
+    # the dive line, which is much tighter than the rig bbox. See
+    # _line_mask_for_tile docstring.
+    line_masks: list[torch.Tensor] | None = None
+    if line_mask_corridor_px is not None and line_abc is not None and line_confidence > 0.0:
+        line_masks = [
+            torch.from_numpy(
+                _line_mask_for_tile(ox, oy, tile, line_abc, line_mask_corridor_px)
+            )
+            for (ox, oy) in grid.origins
+        ]
+
     best_value = -1.0
     best_xy = (None, None)
     best_local: tuple[int, int] | None = None
@@ -424,6 +471,11 @@ def predict_frame(
             ).to(heatmap_probs.device)
             # heatmap_probs is [B, 1, H, W]; unsqueeze masks to broadcast cleanly.
             heatmap_probs = heatmap_probs * chunk_masks.unsqueeze(1)
+        if line_masks is not None:
+            chunk_line_masks = torch.stack(
+                [line_masks[chunk_start + i] for i in range(heatmap_probs.shape[0])]
+            ).to(heatmap_probs.device)
+            heatmap_probs = heatmap_probs * chunk_line_masks.unsqueeze(1)
 
         flat = heatmap_probs.view(heatmap_probs.shape[0], -1)
         max_vals, max_idx = flat.max(dim=1)
@@ -508,6 +560,7 @@ def predict_frame_with_cascade(
     bayer_excess_image: np.ndarray | None = None,
     bayer_excess_scale: float = 4096.0,
     subpixel_refine: bool = False,
+    line_mask_corridor_px: float | None = None,
 ) -> FramePrediction:
     """Two-pass inference (Phase 5 cascade, DESIGN.md §9 followup).
 
@@ -526,13 +579,20 @@ def predict_frame_with_cascade(
     `refine_window` defaults to the tile size; smaller values (e.g. 128)
     focus the refinement tighter at the cost of false-localization risk.
     """
+    # If line masking is requested, we MUST pass line_abc/line_confidence to
+    # the coarse pass so the mask can be built. To keep soft-snap deferred to
+    # after refinement, pass alpha_max=0.0 which makes soft_snap_to_line a
+    # no-op (alpha is clipped to 0).
+    coarse_line_abc = line_abc if line_mask_corridor_px is not None else None
+    coarse_line_conf = line_confidence if line_mask_corridor_px is not None else 0.0
     coarse = predict_frame(
         image_bgr, model,
         wavelength=wavelength, device=device,
         tile=tile, overlap=overlap, batch_size=batch_size,
         presence_threshold=presence_threshold,
         autocast_dtype=autocast_dtype,
-        line_abc=None, line_confidence=0.0,  # snap only after refinement
+        line_abc=coarse_line_abc, line_confidence=coarse_line_conf,
+        alpha_max=0.0,  # suppress coarse-pass snap; cascade snaps after pass-2
         rig_prior=rig_prior,
         rig_prior_bbox=rig_prior_bbox,
         rig_prior_center=rig_prior_center,
@@ -543,6 +603,7 @@ def predict_frame_with_cascade(
         subpixel_refine=subpixel_refine,  # so the fallback-to-coarse path
         # (pass-2 rejected by presence or confidence-drop check below) still
         # benefits from sub-pixel; cropping uses int(round(...)) regardless.
+        line_mask_corridor_px=line_mask_corridor_px,
     )
     if coarse.pred_x is None or coarse.pred_y is None:
         return coarse

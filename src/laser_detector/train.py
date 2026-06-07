@@ -123,6 +123,18 @@ class TrainConfig:
     # None falls back to inference.DEFAULT_RIG_PRIOR_FLOOR.
     inference_rig_prior_floor: float | None = None
     # Gaussian σ override at inference. None → DEFAULT_RIG_PRIOR_SIGMA.
+    # Override y_max of the rig-prior bbox (default 2180). Phase 3.1 tightens
+    # this to clip wandering catastrophic predictions that land below any
+    # legitimate label position; val/test green label y_max is 1552/1624 and
+    # red is 1520/1514, so a y_max around 1700 is safe.
+    inference_rig_prior_bbox_ymax: int | None = None
+    # Phase 3.1d: per-dive line corridor mask. Zeros heatmap pixels farther
+    # than `inference_line_mask_corridor_px` from the fitted dive line at
+    # argmax time. Active only on frames where line_confidence > 0. Much
+    # tighter than the rig bbox (per-dive geometry instead of static bbox);
+    # safe widths from data analysis: ±25 px covers test labels p99=8.98,
+    # masks distractors at 200+ px (e.g., val:427 cluster).
+    inference_line_mask_corridor_px: float | None = None
     inference_rig_prior_sigma_x: float | None = None
     inference_rig_prior_sigma_y: float | None = None
     # When True, the static rig-prior log-mask is added to heatmap logits
@@ -732,6 +744,10 @@ def _run_val_inference(
                 cfg.inference_rig_prior_sigma_x,
                 cfg.inference_rig_prior_sigma_y,
             )
+        if cfg.inference_rig_prior_bbox_ymax is not None:
+            from laser_detector.inference import DEFAULT_RIG_PRIOR_BBOX
+            x0, y0, x1, _y1 = DEFAULT_RIG_PRIOR_BBOX
+            rig_prior_kwargs["rig_prior_bbox"] = (x0, y0, x1, cfg.inference_rig_prior_bbox_ymax)
         predict_fn = (
             predict_frame_with_cascade if cfg.inference_cascade else predict_frame
         )
@@ -756,6 +772,7 @@ def _run_val_inference(
             line_confidence=snap_line_conf,
             alpha_max=cfg.inference_soft_snap_alpha_max,
             subpixel_refine=cfg.inference_subpixel_refine,
+            line_mask_corridor_px=cfg.inference_line_mask_corridor_px,
             **rig_prior_kwargs,
             **cascade_kwargs,
             **bayer_kwargs,

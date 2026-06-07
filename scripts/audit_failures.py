@@ -71,6 +71,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--rig-prior-sigma-x", type=float, default=None)
     p.add_argument("--rig-prior-sigma-y", type=float, default=None)
     p.add_argument(
+        "--rig-prior-bbox-ymax", type=int, default=None,
+        help="Override y_max of the rig-prior bbox (default 2180). Tightens "
+        "the bbox to clip wandering catastrophic predictions. Safe values: "
+        "1700+ (above the max legitimate label y in val/test).",
+    )
+    p.add_argument(
+        "--line-mask-corridor-px", type=float, default=None,
+        help="Phase 3.1d: zero heatmap pixels farther than this many px from "
+        "the fitted dive line at argmax. Per-dive geometric constraint, much "
+        "tighter than the rig bbox. Safe values: 20-30 (covers test labels "
+        "p99 = 8.98). Active only on frames with line_confidence > 0.",
+    )
+    p.add_argument(
         "--cascade", action="store_true",
         help="Use predict_frame_with_cascade refinement at inference.",
     )
@@ -345,6 +358,8 @@ def run_inference(
     cfg.inference_rig_prior_floor = args.rig_prior_floor
     cfg.inference_rig_prior_sigma_x = args.rig_prior_sigma_x
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
+    cfg.inference_rig_prior_bbox_ymax = args.rig_prior_bbox_ymax
+    cfg.inference_line_mask_corridor_px = args.line_mask_corridor_px
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
     cfg.inference_subpixel_refine = args.subpixel_refine

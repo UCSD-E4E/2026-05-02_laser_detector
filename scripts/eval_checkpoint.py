@@ -67,6 +67,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rig-prior-sigma-x", type=float, default=None)
     parser.add_argument("--rig-prior-sigma-y", type=float, default=None)
     parser.add_argument(
+        "--rig-prior-bbox-ymax", type=int, default=None,
+        help="Override y_max of the rig-prior bbox (default 2180). Phase 3.1.",
+    )
+    parser.add_argument(
+        "--line-mask-corridor-px", type=float, default=None,
+        help="Phase 3.1d: zero heatmap pixels farther than this many px from "
+        "the dive line at argmax. Safe values: 20-30.",
+    )
+    parser.add_argument(
         "--cascade", action="store_true",
         help="Use predict_frame_with_cascade (Phase 5 refinement crop) "
         "instead of single-pass predict_frame.",
@@ -194,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.inference_rig_prior_floor = args.rig_prior_floor
     cfg.inference_rig_prior_sigma_x = args.rig_prior_sigma_x
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
+    cfg.inference_rig_prior_bbox_ymax = args.rig_prior_bbox_ymax
+    cfg.inference_line_mask_corridor_px = args.line_mask_corridor_px
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
     cfg.inference_subpixel_refine = args.subpixel_refine
