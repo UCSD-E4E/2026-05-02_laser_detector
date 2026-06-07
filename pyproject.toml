@@ -38,4 +38,6 @@ module-root = "src"
 dev = [
     "matplotlib>=3.10.9",
     "pytest>=9.0.3",
+    "scipy>=1.17.1",
+    "transformers>=5.10.2",
 ]
