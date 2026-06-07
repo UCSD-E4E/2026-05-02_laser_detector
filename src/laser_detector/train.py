@@ -164,6 +164,10 @@ class TrainConfig:
     # Number of input channels to LaserDetector. Default 4 (chrom + wavelength).
     # 6 when bayer_excess channels are added.
     in_channels: int = 4
+    # Encoder backbone for smp.Unet. Default resnet34 matches run3.
+    # Phase 3.2: try HRNet variants ("tu-hrnet_w18", "tu-hrnet_w32") as a
+    # higher-capacity / different-inductive-bias alternative.
+    encoder_name: str = "resnet34"
     # Decoder upsample mode in smp.Unet. "nearest" matches smp's own default
     # but introduces an axis-asymmetric argmax-tie bias; "bilinear" removes
     # it. See notes/bias_attribution.md for the synthetic ablation.
@@ -893,6 +897,7 @@ def train(
     )
 
     model = LaserDetector(
+        encoder_name=cfg.encoder_name,
         in_channels=cfg.in_channels,
         decoder_interpolation=cfg.decoder_interpolation,
     ).to(device)

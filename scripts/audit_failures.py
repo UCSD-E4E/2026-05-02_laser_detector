@@ -330,6 +330,7 @@ def run_inference(
         k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__
     })
     model = LaserDetector(
+        encoder_name=cfg.encoder_name,
         in_channels=cfg.in_channels,
         decoder_interpolation=cfg.decoder_interpolation,
     ).to(ddp.device)

@@ -216,6 +216,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "sub-supercell asymmetry). Requires --bayer-excess and a prewarmed "
         "'bayer_excess_diff' cache. Sets in_channels=7. See notes/bias_attribution.md.",
     )
+    parser.add_argument(
+        "--encoder-name",
+        type=str,
+        default="resnet34",
+        help="smp.Unet encoder backbone. Default 'resnet34' matches run3. "
+        "Try 'tu-hrnet_w18'/'tu-hrnet_w32'/'tu-hrnet_w48' for HRNet variants "
+        "(Phase 3.2).",
+    )
     return parser.parse_args(argv)
 
 
@@ -378,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         wavelength_balance=args.wavelength_balance,
         decoder_interpolation=args.decoder_interpolation,
+        encoder_name=args.encoder_name,
     )
 
     resume_from: Path | None = None

@@ -164,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = TrainConfig(**{k: v for k, v in ckpt["cfg"].items() if k in TrainConfig.__dataclass_fields__})
     model = LaserDetector(
+        encoder_name=cfg.encoder_name,
         in_channels=cfg.in_channels,
         decoder_interpolation=cfg.decoder_interpolation,
     ).to(ddp.device)
