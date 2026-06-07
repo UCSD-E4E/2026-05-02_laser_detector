@@ -1,5 +1,94 @@
 # Pixel-bias attribution — synthetic ablation results
 
+## ⚠️ Major revision (2026-06-06)
+
+**The bias attribution below is largely refuted by a subsequent finding.**
+
+The ~(−1.13, −2.07) px residual bias on real validation data was measured
+with the production inference pipeline running under `torch.autocast(dtype=
+bfloat16)`. Inside the autocast region, `torch.sigmoid(heatmap_logits)` is
+computed in bf16. For a confident peak the logit is ≳ +6, and bf16 sigmoid
+saturates exactly to 1.0 on the peak plus several surrounding pixels (bf16
+has ~8-bit mantissa precision near 1.0, and `sigmoid(x) > 1 − 2⁻⁸` for any
+`x > 5.5`). When the saturated cluster spans multiple pixels, `tensor.max()`
+resolves ties to the lowest flat (row-major) index — i.e. the top-left
+corner of the cluster. Predictions are biased toward the upper-left of the
+true peak, and the magnitude depends on cluster size.
+
+Fixing this is a two-line change in `src/laser_detector/inference.py`:
+
+```python
+# was:
+heatmap_probs = torch.sigmoid(out["heatmap_logits"]).float()
+# now:
+heatmap_logits = out["heatmap_logits"].float()  # promote to fp32 BEFORE sigmoid
+heatmap_probs = torch.sigmoid(heatmap_logits)   # fp32 sigmoid; no saturation tie
+```
+
+(Two spots: the global tiled pass in `predict_frame`, and the refinement
+crop in `predict_frame_with_cascade`.)
+
+### Empirical impact on the production stack (run3 + recipe + sub-pixel)
+
+| split | inference | raw bias on inliers | hit_n3 @ calibrated |
+|---|---|---|---|
+| val | bf16 sigmoid (pre-fix) | (−1.13, −2.07) | 0.8498 |
+| val | **fp32 sigmoid + sub-pixel** | **(−0.20, −0.006)** | **0.8951** (+4.5 pp) |
+| test | bf16 sigmoid (pre-fix) | (≈0 after −1.13,−2.07) | 0.8120 |
+| test | **fp32 sigmoid + sub-pixel** | **(+0.024, +0.026)** | **0.8544** (+4.2 pp) |
+
+The val-derived calibration (−0.20, −0.006) generalizes cleanly to test
+(0.8544 with val-derived offset vs. 0.8549 with test-derived = 0.05 pp gap,
+no meaningful overfit).
+
+The remaining raw bias of (−0.20, −0.006) val / (+0.02, +0.03) test is
+small enough to be label-quality noise and is not stable in sign across
+splits.
+
+### What this revises in the analysis below
+
+- The "architectural Y bias of −2.07 px (real) / −3.70 px (synthetic)"
+  comparison conflated two different inference precisions. The real-data
+  measurements in §"Mechanisms tested" and §"Synthetic ablation" used
+  `bf16` autocast; the synthetic reproducer at the bottom used `fp32` (no
+  autocast context). Apples-to-apples after the fp32 fix:
+  - Real-data inliers, fp32 sigmoid: median (−0.20, −0.006) (val)
+  - Synthetic, fp32 sigmoid: median (−1.00, −3.70) (unchanged — was already fp32)
+  The synthetic still shows a real architectural bias, but the real-data
+  manifestation is much smaller than the synthetic predicts. Real-frame
+  texture and blob characteristics apparently let the model localize closer
+  to truth than the σ=2 isotropic Gaussian benchmark suggests.
+
+- Ablations B and C ("decoder bilinear monkey-patch lifts hit_n3 from
+  0.5255 to 0.6671") were also measured against the **bf16** baseline. Most
+  of that +14.16 pp gain was the same bf16 tie-break being smoothed away by
+  bilinear upsample. Running both arms in fp32 should show a much smaller
+  gap, possibly negligible.
+
+- The run5_bilinear and run6_bayer_diff retrains were motivated by the
+  "decoder is the bias culprit" hypothesis. Their *trained* numbers
+  (bf16-calibrated) were within ~2 pp of run3 on test. **These numbers need
+  to be re-collected under fp32 + sub-pixel inference** to know whether the
+  architectural choices made any real contribution. That re-evaluation is in
+  progress; results are written to `notes/phase2_results.md` and the bottom
+  of this file.
+
+### What this does NOT revise
+
+- The bias *was* deterministic and large in the bf16 pipeline. The
+  calibration constant was a correct empirical fit to that pipeline.
+- Synthetic ablation results were always in fp32 and are technically
+  still valid as a statement about the model's architectural shift in a
+  Gaussian-only signal regime.
+- The G_diff (anti-diagonal Bayer asymmetry) work in run6 is a clean
+  signal-engineering idea independent of the precision bug; it just may
+  not have moved the needle as much as we thought relative to a fixed-up
+  baseline.
+
+---
+
+## Original analysis (2026-06-03)
+
 **Status (2026-06-03)**: Architectural shift confirmed on synthetic data.
 Calibration constant is a justified post-hoc correction for a deterministic
 model-architecture artifact, not a data-fit hack.
