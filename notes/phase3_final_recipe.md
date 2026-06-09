@@ -117,3 +117,5 @@ side is done.
 - `notes/run7_ablation.md` — run7's 10-config matrix
 - `notes/architecture_ablation_matrix.md` — run3 vs run7 side-by-side
 - `notes/phase3_final_recipe.md` — this file
+- `notes/imwut_ba_findings.md` — downstream IMWUT bundle-adjustment study
+  (no, BA doesn't help; depth floor is unmeasured along-line click σ)
