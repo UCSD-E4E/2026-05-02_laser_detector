@@ -168,6 +168,10 @@ class TrainConfig:
     # Phase 3.2: try HRNet variants ("tu-hrnet_w18", "tu-hrnet_w32") as a
     # higher-capacity / different-inductive-bias alternative.
     encoder_name: str = "resnet34"
+    # σ of the Gaussian target heatmap (px). Default 3.0 matches run3/5/6/7.
+    # Phase 3.2: a smaller σ (1.5) gives sharper supervision peaks and may
+    # tighten the borderline-precision mode (70% of remaining test failures).
+    heatmap_sigma_px: float = 3.0
     # Decoder upsample mode in smp.Unet. "nearest" matches smp's own default
     # but introduces an axis-asymmetric argmax-tie bias; "bilinear" removes
     # it. See notes/bias_attribution.md for the synthetic ablation.
@@ -854,6 +858,7 @@ def train(
         records=train_records, loader=image_loader, augment=True,
         linear_cache=cfg.linear_cache,
         bayer_excess_loader=bayer_excess_loader if cfg.use_bayer_excess else None,
+        heatmap_sigma_px=cfg.heatmap_sigma_px,
         seed=cfg.seed + ddp.rank,
     )
     # Single-process dataset used for scoring negatives between epochs.
@@ -861,6 +866,7 @@ def train(
         records=train_records, loader=image_loader, augment=False,
         linear_cache=cfg.linear_cache,
         bayer_excess_loader=bayer_excess_loader if cfg.use_bayer_excess else None,
+        heatmap_sigma_px=cfg.heatmap_sigma_px,
         seed=cfg.seed + 1 + ddp.rank,
     )
     sampler = HardNegativeBalancedSampler(

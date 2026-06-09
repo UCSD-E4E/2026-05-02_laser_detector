@@ -224,6 +224,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Try 'tu-hrnet_w18'/'tu-hrnet_w32'/'tu-hrnet_w48' for HRNet variants "
         "(Phase 3.2).",
     )
+    parser.add_argument(
+        "--heatmap-sigma-px",
+        type=float,
+        default=3.0,
+        help="σ of the Gaussian target heatmap (px). Default 3.0 matches "
+        "run3-7. Smaller values (e.g. 1.5) give sharper supervision peaks "
+        "for sub-pixel-aware training.",
+    )
     return parser.parse_args(argv)
 
 
@@ -387,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         wavelength_balance=args.wavelength_balance,
         decoder_interpolation=args.decoder_interpolation,
         encoder_name=args.encoder_name,
+        heatmap_sigma_px=args.heatmap_sigma_px,
     )
 
     resume_from: Path | None = None

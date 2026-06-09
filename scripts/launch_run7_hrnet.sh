@@ -10,7 +10,9 @@
 set -euo pipefail
 REPO=/scratch/krg/c.crutchfield.642/Repos/school/e4e/fishsense/2026-05-02_laser_detector
 CACHE_DIR=$REPO/data/image_cache_bayer_excess
-RUN7_DIR=$REPO/data/phase2/checkpoints_sensor_bayer_50e_run7_hrnet_w32
+# Fell back to w18 from w32 — w32 (36M params) OOMs at batch_size=8 on 24GB.
+# w18 (16M) fits comfortably and still tests the HRNet inductive bias.
+RUN7_DIR=$REPO/data/phase2/checkpoints_sensor_bayer_50e_run7_hrnet_w18
 mkdir -p "$RUN7_DIR"
 cd "$REPO"
 
@@ -26,7 +28,8 @@ nix develop --command uv run torchrun --standalone --nproc_per_node=4 scripts/ru
   --image-pipeline linear_npy \
   --bayer-excess \
   --bayer-excess-cache-dir "$CACHE_DIR" \
-  --encoder-name tu-hrnet_w32 \
+  --encoder-name tu-hrnet_w18 \
+  --batch-size 8 \
   --num-workers 4 \
   --early-stop-patience 10 \
   --checkpoint-dir "$RUN7_DIR" \
