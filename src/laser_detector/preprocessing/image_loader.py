@@ -150,15 +150,19 @@ def _decode_raw_bayer_excess(
     rb_max = np.maximum(r_arr, b_arr)
     gb_max = np.maximum(g_avg, b_arr)
 
-    # Half-resolution → upsample 2× to match demosaiced cache shape, using
-    # centered bilinear interpolation. Each supercell at half-res index (i, j)
-    # represents the 2×2 photosite region whose centroid sits at full-res
-    # (2i+0.5, 2j+0.5); cv2.resize INTER_LINEAR places the supercell value at
-    # that centroid (its pixel-coord convention is `src = (dst+0.5) * scale −
-    # 0.5`, centroid-aligned for scale=0.5). The previous `np.repeat(..., 2)`
-    # variant placed the supercell value at the block top-left (2i, 2j)
-    # instead — a +0.5 px shift — and caused a constant ~(−1.1, −2.1) px
-    # label-bias on the 6-ch sensor model (see DESIGN.md §10 Risks).
+    # Half-resolution → upsample 2× to match demosaiced cache shape via
+    # `np.repeat`. This places each supercell value at the top-left of its
+    # 2×2 block rather than the centroid; a centered-bilinear variant was
+    # briefly tried (commit `0dba88e`, run4_centered) and reverted because
+    # (a) the bias attributed to this shift was actually a bf16 sigmoid
+    # tie-break (see notes/bias_attribution.md ⚠️ revision) and (b) the
+    # bayer_excess cache was populated with np.repeat and never invalidated,
+    # so bilinear at decode + np.repeat in cache silently disagreed for the
+    # entire run3-run7 training/eval history. Reverting keeps the code
+    # consistent with the cache, the checkpoint's training-time inputs, and
+    # the calibrated `--pixel-bias-offset -0.200 -0.006`. If a future
+    # retrain moves to centered bilinear, invalidate the cache AND
+    # recalibrate the bias offset from val inliers.
     if with_diff_channel:
         # G1 and G2 sit on the anti-diagonal of the supercell — their
         # difference (signed) is the sub-supercell direction signal that
@@ -174,10 +178,7 @@ def _decode_raw_bayer_excess(
         g_excess = np.maximum(g_avg - rb_max, 0).astype(np.uint16)
         r_excess = np.maximum(r_arr - gb_max, 0).astype(np.uint16)
         half = np.stack([g_excess, r_excess], axis=2)  # [H/2, W/2, 2] uint16
-    half_h, half_w = half.shape[:2]
-    full = cv2.resize(
-        half, (half_w * 2, half_h * 2), interpolation=cv2.INTER_LINEAR
-    )
+    full = np.repeat(np.repeat(half, 2, axis=0), 2, axis=1)
 
     # Trim/pad to the demosaiced visible size if odd-by-one.
     full = full[:H, :W]

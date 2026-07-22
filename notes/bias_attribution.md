@@ -1,5 +1,40 @@
 # Pixel-bias attribution — synthetic ablation results
 
+## ⚠️ Second revision (2026-07-22)
+
+The bayer_excess upsample switch to centered bilinear
+(commit `0dba88e "Fix Bayer-excess upsample bias: centered bilinear instead
+of np.repeat"`, subsequently amended in `f6c262c "run4_centered: Bayer-excess
+upsample fix did not eliminate the bias"`) has been **reverted** and the code
+returned to `np.repeat`. Two independently sufficient reasons:
+
+1. **The bias attribution the switch was meant to correct was refuted** by
+   the bf16 sigmoid finding documented in the first revision below. Under
+   fp32 sigmoid + logit-based sub-pixel refinement, the residual raw bias
+   drops to (−0.20, −0.006) val / (+0.024, +0.026) test — well inside
+   labeler click σ. The np.repeat vs centered-bilinear distinction is
+   irrelevant at this scale.
+
+2. **The bayer_excess cache was never invalidated** when the code
+   switched. Cache files date from May 26 with `np.repeat` outputs; the
+   centered-bilinear code shipped June 1. Cache is keyed by
+   `image_checksum`, so run3 training + every downstream audit + the
+   published val 0.9081 / test 0.8615 / bias offset (−0.20, −0.006) were
+   all computed against `np.repeat` inputs. Reverting the code makes it
+   consistent with the cache, the checkpoint's training-time inputs, and
+   the calibrated bias offset.
+
+The centered-bilinear branch was tried as `run4_centered` and its own
+commit message concluded it "did not eliminate the bias." The revert
+consolidates that result.
+
+If a future retrain moves to centered bilinear (or any other decode
+change), the required sequence is: invalidate the bayer_excess cache,
+prewarm from scratch, retrain, re-derive the bias offset from val
+inliers, republish the checkpoint. Skipping any of those steps
+reintroduces the invisible-mismatch class of bug this revert is
+preventing.
+
 ## ⚠️ Major revision (2026-06-06)
 
 **The bias attribution below is largely refuted by a subsequent finding.**

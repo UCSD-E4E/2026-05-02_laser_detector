@@ -403,6 +403,7 @@ def predict_frame(
     bayer_excess_scale: float = 4096.0,
     subpixel_refine: bool = False,
     line_mask_corridor_px: float | None = None,
+    intermediates_out: dict | None = None,
 ) -> FramePrediction:
     """Run tiled inference on a single 4K frame.
 
@@ -411,6 +412,15 @@ def predict_frame(
     falls below it.
 
     Frame-level confidence = max(sigmoid(tile_presence_logits)) per DESIGN.md §6.
+
+    If `intermediates_out` is a mutable dict, key stages are recorded into it
+    for external instrumentation (validation-bundle builder, debugging). Keys
+    populated: `winning_tile_input` (6-ch preprocessed input for the winning
+    tile), `winning_tile_heatmap_logits` (fp32), `winning_tile_origin` (x, y
+    frame coords), `winning_tile_idx`, `per_tile_presence` (float32 array),
+    `tile_origins` (int64 array), `coarse_local_argmax` (x, y in tile
+    coords), `coarse_argmax_pre_subpixel` (x, y in frame coords, integer),
+    `coarse_argmax` (x, y after any subpixel refinement).
     """
     grid = compute_tile_grid(*image_bgr.shape[:2], tile=tile, overlap=overlap)
     padded = _reflect_pad(image_bgr, grid.padded_h, grid.padded_w)
@@ -473,7 +483,14 @@ def predict_frame(
     best_local: tuple[int, int] | None = None
     best_origin: tuple[int, int] | None = None
     best_heatmap_2d: torch.Tensor | None = None  # winning tile, for sub-pixel refine
+    best_tile_idx = -1
+    best_tile_input: np.ndarray | None = None
     presence_max = 0.0
+    # Per-tile presence capture for intermediates. Kept out of the hot path
+    # unless requested (still cheap — one float per tile).
+    per_tile_presence = (
+        np.zeros(len(tile_arrays), dtype=np.float32) if intermediates_out is not None else None
+    )
 
     autocast_ctx = (
         torch.autocast(device_type=device.type, dtype=autocast_dtype)
@@ -505,14 +522,20 @@ def predict_frame(
         max_vals, max_idx = flat.max(dim=1)
 
         for i, (mv, mi) in enumerate(zip(max_vals.tolist(), max_idx.tolist())):
+            tile_i = chunk_start + i
+            if per_tile_presence is not None:
+                per_tile_presence[tile_i] = float(presence_probs[i].max().item())
             if mv > best_value:
                 best_value = mv
                 local_y, local_x = divmod(mi, tile)
-                ox, oy = grid.origins[chunk_start + i]
+                ox, oy = grid.origins[tile_i]
                 best_xy = (float(local_x + ox), float(local_y + oy))
                 best_local = (local_x, local_y)
                 best_origin = (ox, oy)
-                if subpixel_refine:
+                best_tile_idx = tile_i
+                if intermediates_out is not None:
+                    best_tile_input = tile_arrays[tile_i]
+                if subpixel_refine or intermediates_out is not None:
                     # Refine on LOGITS, not probs: under bf16 autocast, sigmoid
                     # saturates to 1.0 at the peak and the 3-point cross can't
                     # distinguish "true peak" from "neighbor +1 step". Logits
@@ -526,6 +549,9 @@ def predict_frame(
         return FramePrediction(pred_x=None, pred_y=None, pred_confidence=presence_max)
 
     pred_x, pred_y = best_xy
+    coarse_pre_subpixel: tuple[float, float] | None = (
+        (float(pred_x), float(pred_y)) if pred_x is not None else None
+    )
     if pred_x is not None:
         if subpixel_refine and best_heatmap_2d is not None and best_local is not None and best_origin is not None:
             local_x, local_y = best_local
@@ -546,6 +572,25 @@ def predict_frame(
             )
             pred_x = max(0.0, min(pred_x, float(grid.original_w - 1)))
             pred_y = max(0.0, min(pred_y, float(grid.original_h - 1)))
+    if intermediates_out is not None:
+        intermediates_out['tile_origins'] = np.asarray(grid.origins, dtype=np.int64)
+        intermediates_out['per_tile_presence'] = per_tile_presence
+        intermediates_out['winning_tile_idx'] = best_tile_idx
+        intermediates_out['winning_tile_origin'] = (
+            np.asarray(best_origin, dtype=np.int64) if best_origin is not None else None
+        )
+        intermediates_out['winning_tile_input'] = best_tile_input
+        intermediates_out['winning_tile_heatmap_logits'] = (
+            best_heatmap_2d.numpy().copy() if best_heatmap_2d is not None else None
+        )
+        intermediates_out['coarse_local_argmax'] = (
+            np.asarray(best_local, dtype=np.int64) if best_local is not None else None
+        )
+        intermediates_out['coarse_argmax_pre_subpixel'] = coarse_pre_subpixel
+        intermediates_out['coarse_argmax'] = (
+            (float(pred_x), float(pred_y)) if pred_x is not None else None
+        )
+        intermediates_out['presence_max'] = presence_max
     return FramePrediction(
         pred_x=pred_x, pred_y=pred_y, pred_confidence=presence_max
     )
@@ -585,6 +630,7 @@ def predict_frame_with_cascade(
     bayer_excess_scale: float = 4096.0,
     subpixel_refine: bool = False,
     line_mask_corridor_px: float | None = None,
+    intermediates_out: dict | None = None,
 ) -> FramePrediction:
     """Two-pass inference (Phase 5 cascade, DESIGN.md §9 followup).
 
@@ -609,6 +655,8 @@ def predict_frame_with_cascade(
     # no-op (alpha is clipped to 0).
     coarse_line_abc = line_abc if line_mask_corridor_px is not None else None
     coarse_line_conf = line_confidence if line_mask_corridor_px is not None else 0.0
+    # Forward coarse-stage intermediates into the same dict if requested.
+    coarse_intermediates = {} if intermediates_out is not None else None
     coarse = predict_frame(
         image_bgr, model,
         wavelength=wavelength, device=device,
@@ -628,7 +676,10 @@ def predict_frame_with_cascade(
         # (pass-2 rejected by presence or confidence-drop check below) still
         # benefits from sub-pixel; cropping uses int(round(...)) regardless.
         line_mask_corridor_px=line_mask_corridor_px,
+        intermediates_out=coarse_intermediates,
     )
+    if intermediates_out is not None and coarse_intermediates is not None:
+        intermediates_out.update(coarse_intermediates)
     if coarse.pred_x is None or coarse.pred_y is None:
         return coarse
 
@@ -688,12 +739,29 @@ def predict_frame_with_cascade(
         refined_x = float(x0 + local_x)
         refined_y = float(y0 + local_y)
 
+    # Capture cascade intermediates BEFORE the fallback / snap so the
+    # oracle records the pre-fallback + pre-snap (x, y) alongside the flag.
+    cascade_pre_fallback_xy: tuple[float, float] = (refined_x, refined_y)
+
     # Only accept the refinement if the local heatmap actually has a peak; if
     # presence drops below threshold or the local peak is much weaker than
     # the coarse one, fall back to coarse.
+    fell_back = False
     if presence_threshold is not None and presence_prob < presence_threshold:
-        return coarse
-    if refined_value < 0.5 * coarse.pred_confidence:
+        fell_back = True
+    elif refined_value < 0.5 * coarse.pred_confidence:
+        fell_back = True
+
+    if intermediates_out is not None:
+        intermediates_out['cascade_heatmap_logits'] = heatmap_logits[0].detach().cpu().numpy().copy()
+        intermediates_out['cascade_crop_origin'] = np.asarray([x0, y0], dtype=np.int64)
+        intermediates_out['cascade_local_argmax'] = np.asarray([local_x, local_y], dtype=np.int64)
+        intermediates_out['cascade_refined_value'] = float(refined_value)
+        intermediates_out['cascade_presence'] = float(presence_prob)
+        intermediates_out['cascade_pre_fallback_xy'] = cascade_pre_fallback_xy
+        intermediates_out['cascade_fell_back'] = fell_back
+
+    if fell_back:
         return coarse
 
     refined_x = max(0.0, min(refined_x, float(w - 1)))
@@ -710,6 +778,10 @@ def predict_frame_with_cascade(
         )
         refined_x = max(0.0, min(refined_x, float(w - 1)))
         refined_y = max(0.0, min(refined_y, float(h - 1)))
+
+    if intermediates_out is not None:
+        intermediates_out['final_pre_bias_xy'] = (float(refined_x), float(refined_y))
+        intermediates_out['final_conf'] = float(final_conf)
 
     return FramePrediction(
         pred_x=refined_x, pred_y=refined_y, pred_confidence=final_conf,
