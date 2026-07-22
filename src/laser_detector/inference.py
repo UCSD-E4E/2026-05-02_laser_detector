@@ -28,6 +28,30 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TILE_OVERLAP = 256
 
+
+def rectify_prediction(
+    pred_x: float, pred_y: float,
+    K: np.ndarray, dist: np.ndarray,
+) -> tuple[float, float]:
+    """Convert a prediction from raw pixel space to rectified (undistorted)
+    pixel space via `cv2.undistortPoints(..., P=K)`.
+
+    Addresses issue #9: labels are made on rectified images (via
+    `RectifiedImage(RawImage(...))` in the labeling UI) but the detector
+    processes raw images, so predictions land in raw pixel space. Downstream
+    3D reconstruction expects rectified coordinates. This shifts the
+    prediction into the rectified frame using the per-rig camera intrinsics.
+
+    Empirical impact per issue #9's own analysis: median 0.02 px, p95 0.23 px,
+    p99 1.01 px displacement. Applying this is a small correction; skipping it
+    is harmless for aggregate hit_n3 metrics but wrong for downstream 3D.
+    """
+    pts = np.asarray([[[pred_x, pred_y]]], dtype=np.float32)
+    K = np.asarray(K, dtype=np.float32).reshape(3, 3)
+    dist = np.asarray(dist, dtype=np.float32).reshape(-1)
+    out = cv2.undistortPoints(pts, K, dist, P=K)
+    return float(out[0, 0, 0]), float(out[0, 0, 1])
+
 # Static rig prior on laser position in **sensor-coordinate** pixels of the
 # Olympus TG-6 (3016×4014). Derived from all positive train labels mapped
 # back into sensor coords via the orf_flip parquet: median ≈ (1977, 1343),

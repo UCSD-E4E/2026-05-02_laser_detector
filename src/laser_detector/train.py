@@ -38,6 +38,7 @@ from laser_detector.eval import PREDICTION_TABLE_SCHEMA, evaluate
 from laser_detector.inference import (
     predict_frame,
     predict_frame_with_cascade,
+    rectify_prediction,
     rig_prior_log_mask_batched,
 )
 from laser_detector.model import (
@@ -161,6 +162,14 @@ class TrainConfig:
     # (LOO-validated). Should be 0 for 4-ch JPEG checkpoints.
     inference_pixel_bias_offset_x: float = 0.0
     inference_pixel_bias_offset_y: float = 0.0
+    # Issue #9: labels live in rectified (undistorted) pixel space but the
+    # image loader consumes raw images, so predictions land in raw pixel space.
+    # When True, apply cv2.undistortPoints per prediction using per-rig K + dist
+    # loaded from `inference_rig_intrinsics_path` — moves predictions from raw
+    # → rectified. Empirically <0.1 pp hit_n3 impact but load-bearing for
+    # downstream 3D reconstruction consistency.
+    inference_rectify_output: bool = False
+    inference_rig_intrinsics_path: str | None = None
     # Number of input channels to LaserDetector. Default 4 (chrom + wavelength).
     # 6 when bayer_excess channels are added.
     in_channels: int = 4
@@ -706,6 +715,30 @@ def _benchmark_latency(
     return metrics
 
 
+def _load_rig_intrinsics(path: str | None) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Load per-rig camera K + dist coefficients from a parquet written by
+    scripts/ingest_camera_intrinsics.py. Returns {} on missing path so the
+    caller can noop rectification cleanly. Schema:
+    rig_id (int), fx/fy/cx/cy (float), dist (list[float])."""
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        logger.warning('rig intrinsics path %s does not exist; rectification will noop', p)
+        return {}
+    df = pl.read_parquet(p)
+    out: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for r in df.iter_rows(named=True):
+        K = np.array([
+            [r['fx'], 0.0, r['cx']],
+            [0.0, r['fy'], r['cy']],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32)
+        dist = np.array(r['dist'], dtype=np.float32)
+        out[int(r['rig_id'])] = (K, dist)
+    return out
+
+
 def _run_val_inference(
     model: torch.nn.Module,
     val_records: list[FrameRecord],
@@ -725,6 +758,15 @@ def _run_val_inference(
     inference_model.eval()
     rows: list[dict] = []
     autocast_dtype = torch.bfloat16 if cfg.use_bf16 else None
+
+    # Issue #9: per-rig intrinsics for output rectification. Loaded once per
+    # rank; noop dict if the feature is off or the parquet is missing.
+    rig_intrinsics: dict[int, tuple[np.ndarray, np.ndarray]] = (
+        _load_rig_intrinsics(cfg.inference_rig_intrinsics_path)
+        if cfg.inference_rectify_output else {}
+    )
+    if cfg.inference_rectify_output and not rig_intrinsics and ddp.is_main:
+        logger.warning('inference_rectify_output=True but no rig intrinsics loaded; rectification will noop')
 
     my_records = val_records[ddp.rank :: ddp.world_size]
     iterator = (
@@ -795,6 +837,23 @@ def _run_val_inference(
             px = max(0.0, min(px, float(w - 1)))
             py = max(0.0, min(py, float(h - 1)))
             pred = replace(pred, pred_x=px, pred_y=py)
+        # Issue #9: rectify raw-pixel-space predictions into rectified space
+        # (where labels live). Order matters: rectify AFTER bias offset — the
+        # offset was calibrated against label residuals in raw space, so it
+        # cancels the raw-space bias first; rectification then does the final
+        # coord-frame conversion. Skip on out-of-bbox or missing intrinsics.
+        if (
+            pred.pred_x is not None
+            and cfg.inference_rectify_output
+            and rec.rig_id is not None
+            and rec.rig_id in rig_intrinsics
+        ):
+            K, dist = rig_intrinsics[rec.rig_id]
+            rx, ry = rectify_prediction(pred.pred_x, pred.pred_y, K, dist)
+            h, w = image_bgr.shape[:2]
+            rx = max(0.0, min(rx, float(w - 1)))
+            ry = max(0.0, min(ry, float(h - 1)))
+            pred = replace(pred, pred_x=rx, pred_y=ry)
         rows.append({
             "image_id": rec.image_id,
             "pred_x": pred.pred_x,

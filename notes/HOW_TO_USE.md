@@ -100,6 +100,28 @@ A null `pred_x` means "no laser detected" (cascade rejected, OR presence
 below `--presence-threshold`). Non-null with low confidence means
 "detected, but uncertain."
 
+**Coordinate frame** (important for downstream 3D reconstruction): by default,
+`pred_x`, `pred_y` are in **raw pixel space** — same coordinate frame as the
+raw image the detector consumed. Labels in `frames.parquet` are in
+**rectified (undistorted) pixel space** because the labeling UI renders via
+`RectifiedImage(RawImage(...))`. See issue #9. Empirical impact on hit_n3 is
+negligible (median 0.02 px, p99 1.01 px displacement) but coord-frame
+mismatch matters for downstream 3D pipelines that expect rectified inputs.
+
+To emit rectified predictions, run once to build the per-rig intrinsics
+parquet:
+
+```bash
+nix develop --command uv run python scripts/ingest_camera_intrinsics.py \
+  --frames data/frames.parquet \
+  --out data/rig_intrinsics.parquet
+# (prompts for API credentials, or reads FISHSENSE_USERNAME / FISHSENSE_PASSWORD env vars)
+```
+
+Then pass `--rectify-output --rig-intrinsics-path data/rig_intrinsics.parquet`
+to `eval_checkpoint.py` or `audit_failures.py`. Predictions in the parquet
+will be in the rectified frame.
+
 ---
 
 ## Common entry points

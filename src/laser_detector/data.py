@@ -180,6 +180,8 @@ class FrameRecord:
     image_checksum: str
     label_xy: tuple[float, float] | None  # None = negative frame
     wavelength: str | None  # "red" / "green" / None
+    rig_id: int | None = None  # = camera_id; used at inference for
+    # rectification (issue #9). None on records that predate the field.
     # Per-dive line fit (DESIGN.md §3.1). The trio (a, b, c) parameterizes
     # `a*x + b*y + c = 0` in frame coordinates, with (a, b) unit-normalized
     # so |a*x + b*y + c| is the perpendicular distance directly. None for
@@ -611,6 +613,7 @@ def build_records(
             )
             line_conf = float(row.get("line_confidence") or 0.0)
             is_line_conf = bool(row.get("is_line_confident") or False)
+        rig_id_val = row.get("rig_id")
         records.append(
             FrameRecord(
                 image_id=int(row["image_id"]),
@@ -619,6 +622,7 @@ def build_records(
                 image_checksum=str(row["image_checksum"]),
                 label_xy=label_xy,
                 wavelength=row["wavelength"],
+                rig_id=int(rig_id_val) if rig_id_val is not None else None,
                 line_abc=line_abc,
                 line_confidence=line_conf,
                 is_line_confident=is_line_conf,

@@ -76,6 +76,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the dive line at argmax. Safe values: 20-30.",
     )
     parser.add_argument(
+        "--rectify-output", action="store_true",
+        help="Issue #9: apply cv2.undistortPoints to move predictions from raw "
+        "pixel space to rectified space (matching the coord frame of labels). "
+        "Requires --rig-intrinsics-path.",
+    )
+    parser.add_argument(
+        "--rig-intrinsics-path", type=Path, default=None,
+        help="Path to per-rig intrinsics parquet (from ingest_camera_intrinsics.py). "
+        "Required with --rectify-output.",
+    )
+    parser.add_argument(
         "--cascade", action="store_true",
         help="Use predict_frame_with_cascade (Phase 5 refinement crop) "
         "instead of single-pass predict_frame.",
@@ -206,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg.inference_rig_prior_sigma_y = args.rig_prior_sigma_y
     cfg.inference_rig_prior_bbox_ymax = args.rig_prior_bbox_ymax
     cfg.inference_line_mask_corridor_px = args.line_mask_corridor_px
+    cfg.inference_rectify_output = args.rectify_output
+    cfg.inference_rig_intrinsics_path = str(args.rig_intrinsics_path) if args.rig_intrinsics_path else None
     cfg.inference_cascade = args.cascade
     cfg.inference_cascade_refine_window = args.cascade_refine_window
     cfg.inference_subpixel_refine = args.subpixel_refine
