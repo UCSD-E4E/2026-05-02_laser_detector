@@ -25,8 +25,15 @@ same-sign residuals with red slightly tighter than green
 sub-pixel drift, not a wavelength-specific artifact.
 
 Val hit_n3 goes from 0.9081 (Ada bf16 + old bias) to **0.9100** (Ada
-fp32 + new bias). The +0.19 pp lift is small; the reproducibility win
-(same numbers on any IEEE-754 hardware) is the point.
+fp32 + new bias). Test hit_n3 goes from 0.8615 to **0.8635** with the
+same val-derived offset. Both splits gain +0.19–0.20 pp. Small win;
+the reproducibility (same numbers on any IEEE-754 hardware) is the
+point.
+
+**Test-derived bias** for comparison: `(−0.209, −0.093)`. Differs from
+val-derived by `(−0.030, −0.070)` px, well below measurement noise;
+val-derived offset yields 0.8635 hit_n3 on test vs. 0.8630 for
+test-derived — no overfit. Val-derived stays production.
 
 The `notes/HOW_TO_USE.md` "bf16 sigmoid caveat" section is now
 "bf16 at inference — DISABLED" and documents the current default.

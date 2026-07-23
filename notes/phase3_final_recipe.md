@@ -28,7 +28,13 @@ logit-based parabolic peak refinement + line mask + bias offset. See
 `phase3_results.md` for the cumulative trajectory:
 
 - val hit_n3: 0.8498 (bf16 baseline) → 0.9081 (bf16 + old bias) → **0.9100** (fp32 + new bias, +0.19 pp reproducibility fix)
-- test hit_n3: 0.8120 → 0.8615 (bf16 + old bias); fp32 test refit pending
+- test hit_n3: 0.8120 (bf16 baseline) → 0.8615 (bf16 + old bias) → **0.8635** (fp32 + new bias, +0.20 pp)
+
+**Test-derived bias for comparison** (not adopted; val transfers cleanly):
+`(−0.209, −0.093)`, differs from val-derived by `(−0.030, −0.070)` px.
+Val-derived offset gives 0.8635 hit_n3 on test vs. 0.8630 for
+test-derived — well inside noise. Same overfit-check story as the
+original v3 bias: val-derived is the production number.
 
 ## Architecture × inference-constraint ablation matrix (final)
 
