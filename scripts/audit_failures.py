@@ -383,6 +383,7 @@ def run_inference(
     predictions = _run_val_inference(
         model, records, image_loader, ddp.device, cfg, ddp,
         bayer_excess_loader=bayer_excess_loader,
+        shard_dir=args.out_dir / "shards",
     )
 
     if not ddp.is_main:

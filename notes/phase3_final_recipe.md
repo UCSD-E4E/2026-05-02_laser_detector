@@ -6,7 +6,7 @@ exploration (run7 HRNet-w18) and the 10-config inference-constraint matrix
 on both architectures confirm we're at the ceiling. **No production changes
 recommended.**
 
-## Production recipe (unchanged)
+## Production recipe
 
 ```
 --checkpoint data/phase2/checkpoints_sensor_bayer_50e_run3/epoch_021.pt
@@ -15,15 +15,20 @@ recommended.**
 --cascade
 --subpixel-refine
 --line-mask-corridor-px 25
---pixel-bias-offset -0.200 -0.006
+--pixel-bias-offset -0.179 -0.023
 ```
 
-This is run3 (ResNet-34 UNet, 6-ch bayer_excess) + v3 inference (fp32 sigmoid,
-logit-based parabolic peak refinement) + line mask + bias offset. See
+**Post-close revision (2026-07-23)**: `--pixel-bias-offset` recalibrated
+under fp32 inference (issue #13); previous value was `-0.200 -0.006`
+against Ada bf16. See `bias_attribution.md` for the fp32 refit
+rationale and `HOW_TO_USE.md`'s "bf16 at inference — DISABLED" section.
+
+This is run3 (ResNet-34 UNet, 6-ch bayer_excess) + fp32 inference +
+logit-based parabolic peak refinement + line mask + bias offset. See
 `phase3_results.md` for the cumulative trajectory:
 
-- val hit_n3: 0.8498 (bf16 baseline) → **0.9081** (cum +5.83 pp)
-- test hit_n3: 0.8120 → **0.8615** (cum +4.95 pp)
+- val hit_n3: 0.8498 (bf16 baseline) → 0.9081 (bf16 + old bias) → **0.9100** (fp32 + new bias, +0.19 pp reproducibility fix)
+- test hit_n3: 0.8120 → 0.8615 (bf16 + old bias); fp32 test refit pending
 
 ## Architecture × inference-constraint ablation matrix (final)
 

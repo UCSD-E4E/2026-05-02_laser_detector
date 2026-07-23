@@ -58,7 +58,7 @@ nix develop --command uv run torchrun --standalone --nproc_per_node=4 \
   --cascade \
   --subpixel-refine \
   --line-mask-corridor-px 25 \
-  --pixel-bias-offset -0.200 -0.006 \
+  --pixel-bias-offset -0.179 -0.023 \
   --out-dir data/audit/your_run_name
 ```
 
@@ -77,7 +77,7 @@ when combined with the others).
 | `--cascade` | Two-pass inference: pass-1 finds coarse argmax on the full 4K tiled grid; pass-2 re-runs the model on a 256×256 crop around the coarse argmax and refines. Falls back to coarse if pass-2 presence drops below threshold. |
 | `--subpixel-refine` | Parabolic-fit sub-pixel peak refinement on the heatmap LOGITS (not probs — see "bf16 caveat" below). Adds ~0.3 px of localization precision. |
 | `--line-mask-corridor-px 25` | Per-dive geometric corridor: zero heatmap pixels >25 px perpendicular to the fitted dive line. Kills the val:427-style distractor mode. Only fires on frames with high line confidence. |
-| `--pixel-bias-offset -0.200 -0.006` | Constant per-checkpoint calibration. Subtracts (dx, dy) from the final prediction. Empirically derived from val inliers; works on test too. |
+| `--pixel-bias-offset -0.179 -0.023` | Constant per-checkpoint calibration. Subtracts (dx, dy) from the final prediction. Empirically derived from val inliers; works on test too. |
 
 ### Output format
 
@@ -137,7 +137,7 @@ nix develop --command uv run torchrun --standalone --nproc_per_node=4 \
   --bayer-excess-cache-dir data/image_cache_bayer_excess \
   --soft-snap-inference --rig-prior --rig-prior-floor 1.0 --cascade \
   --subpixel-refine --line-mask-corridor-px 25 \
-  --pixel-bias-offset -0.200 -0.006 \
+  --pixel-bias-offset -0.179 -0.023 \
   --no-mlflow
 ```
 
@@ -243,29 +243,37 @@ This takes ~2 hours on 8 workers with NAS access.
 
 ## Known issues / things to be careful about
 
-### bf16 sigmoid caveat (important)
+### bf16 at inference — DISABLED (issue #13)
 
-**Under `torch.autocast(bf16)`, `torch.sigmoid(logits)` saturates near 1.0
-on confident peaks** — multiple pixels round to exactly 1.0, `.max()` picks
-the lowest flat index (top-left), and predictions land 1-2 px above-left of
-the true peak.
+**Inference now runs in fp32 end-to-end.** `predict_frame` and
+`predict_frame_with_cascade` default `autocast_dtype=None`, and
+`_run_val_inference` no longer forwards `cfg.use_bf16`.
 
-This was the original source of the production calibration constant. The
-fix (already in `predict_frame` and `predict_frame_with_cascade`) is:
+The earlier "float first, then sigmoid" fix solved the *sigmoid*
+tie-break (multiple pixels rounding to `1.0` after saturation). It did
+**not** solve the *logit* tie-break: two competing pixels can round to
+identical bf16 buckets in the model's forward pass, and the `.float()`
+cast afterwards is lossless zero-padding — the precision is already
+gone. `flat.max(dim=1)` then breaks the tie by row-major index. Because
+cuDNN picks different tensor-core kernels on different SMs, the same
+weights + same input produce different bf16 logits on Ada (SM89) vs
+Ampere (SM80) vs Hopper — argmax outcomes differ by up to ~200 px on
+frames where the peak margin is <1 bf16 ulp. Empirically 3/4 sampled
+positives have sub-ulp margins on this checkpoint, so this is normal,
+not tail behavior.
 
-```python
-# WRONG — sigmoid in bf16, then float
-heatmap_probs = torch.sigmoid(logits).float()
+Running the head outside autocast — or simplest, disabling autocast on
+the entire inference path — makes the argmax IEEE-754 stable and
+therefore reproducible across GPUs. On our RTX 4500 Ada, dropping bf16
+from inference does not slow it down (kernel-launch dominated, not
+tensor-core dominated). The 3222-frame val hit_n3 goes from 0.9081
+(bf16 + old bias) to 0.9100 (fp32 + new bias) — small win, big
+reproducibility gain.
 
-# RIGHT — float first, then sigmoid
-heatmap_logits = logits.float()
-heatmap_probs = torch.sigmoid(heatmap_logits)
-```
-
-**Any new code that does sigmoid-then-argmax on autocasted heatmaps MUST
-promote to float32 before sigmoid.** Same goes for parabolic peak refinement
-— refine on LOGITS, not on post-sigmoid probabilities. The current
-production code does this; new code should too.
+Training still uses bf16 autocast (fp32 for training would materially
+slow it down). If you write new code that runs a sigmoid-then-argmax on
+autocasted heatmaps, either wrap it in `autocast(dtype=torch.bfloat16,
+enabled=False)` or promote to fp32 *before* the forward pass.
 
 ### Dive 249 path discrepancy
 

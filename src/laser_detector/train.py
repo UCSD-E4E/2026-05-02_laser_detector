@@ -747,6 +747,7 @@ def _run_val_inference(
     cfg: TrainConfig,
     ddp: DDPContext,
     bayer_excess_loader: ImageLoader | None = None,
+    shard_dir: Path | None = None,
 ) -> pl.DataFrame:
     """Run tiled inference over every val frame; return predictions matching
     `PREDICTION_TABLE_SCHEMA`. With DDP active, each rank handles a stride
@@ -757,7 +758,10 @@ def _run_val_inference(
     inference_model = model.module if isinstance(model, DistributedDataParallel) else model
     inference_model.eval()
     rows: list[dict] = []
-    autocast_dtype = torch.bfloat16 if cfg.use_bf16 else None
+    # Val inference always runs in fp32 (issue #13): bf16 autocast makes the
+    # heatmap argmax hardware-dependent because rival pixels routinely round
+    # to the same bf16 value. Decouple val precision from training precision
+    # so val curves match what production will emit.
 
     # Issue #9: per-rig intrinsics for output rectification. Loaded once per
     # rank; noop dict if the feature is off or the parquet is missing.
@@ -817,7 +821,6 @@ def _run_val_inference(
             wavelength=rec.wavelength,
             device=device,
             batch_size=cfg.inference_batch_size,
-            autocast_dtype=autocast_dtype,
             line_abc=snap_line_abc,
             line_confidence=snap_line_conf,
             alpha_max=cfg.inference_soft_snap_alpha_max,
@@ -848,8 +851,8 @@ def _run_val_inference(
             and rec.rig_id is not None
             and rec.rig_id in rig_intrinsics
         ):
-            K, dist = rig_intrinsics[rec.rig_id]
-            rx, ry = rectify_prediction(pred.pred_x, pred.pred_y, K, dist)
+            K, dist_coefs = rig_intrinsics[rec.rig_id]
+            rx, ry = rectify_prediction(pred.pred_x, pred.pred_y, K, dist_coefs)
             h, w = image_bgr.shape[:2]
             rx = max(0.0, min(rx, float(w - 1)))
             ry = max(0.0, min(ry, float(h - 1)))
@@ -863,6 +866,15 @@ def _run_val_inference(
 
     if not ddp.is_distributed:
         return pl.DataFrame(rows, schema=PREDICTION_TABLE_SCHEMA)
+
+    # Persist a per-rank shard BEFORE the gather so a crash in the collective
+    # (or in the post-gather concatenation) doesn't lose the compute. Only
+    # written when the caller wired shard_dir — training's per-epoch val
+    # eval leaves it None to avoid disk spam.
+    if shard_dir is not None:
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        shard_path = shard_dir / f"rank{ddp.rank:02d}.parquet"
+        pl.DataFrame(rows, schema=PREDICTION_TABLE_SCHEMA).write_parquet(shard_path)
 
     # Gather rows from all ranks to rank 0. Non-zero ranks return an empty
     # DataFrame so the trainer skips eval/log on them.

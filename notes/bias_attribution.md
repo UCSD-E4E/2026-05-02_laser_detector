@@ -1,5 +1,36 @@
 # Pixel-bias attribution — synthetic ablation results
 
+## ⚠️ Third revision (2026-07-23) — fp32 refit (issue #13)
+
+The `(−0.20, −0.006)` offset was calibrated against inference that ran the
+model forward under `torch.autocast(bfloat16)`. The prior fp32-sigmoid
+fix (Phase 2A, June) solved the sigmoid tie-break, but the logits
+themselves were still bf16-quantized in the forward pass. Under bf16,
+rival pixels routinely round to identical values and `flat.max()` breaks
+ties by row-major index — an outcome that depends on the tensor-core
+kernel cuDNN selects, which varies across GPU architectures. On our
+Ada card 3/4 sampled val positives showed sub-ulp margins, and Ampere
+reproduced ~200 px argmax shifts on the same weights + input.
+
+**Fix**: `predict_frame` and `predict_frame_with_cascade` now default
+`autocast_dtype=None`, and `_run_val_inference` no longer forwards
+`cfg.use_bf16`. Inference is fp32 end-to-end; training is unchanged.
+
+**Refit**: with the fp32 inference path, val-inlier mean signed residual
+is `(−0.1794, −0.0232)`. New production offset: **`−0.179 −0.023`**.
+Old value stays in the git history (checkpoint calibration is a
+per-checkpoint number, not a per-model number). Per-wavelength shows
+same-sign residuals with red slightly tighter than green
+(red −0.15 −0.02, green −0.31 −0.05, both same-sign) — reasonable
+sub-pixel drift, not a wavelength-specific artifact.
+
+Val hit_n3 goes from 0.9081 (Ada bf16 + old bias) to **0.9100** (Ada
+fp32 + new bias). The +0.19 pp lift is small; the reproducibility win
+(same numbers on any IEEE-754 hardware) is the point.
+
+The `notes/HOW_TO_USE.md` "bf16 sigmoid caveat" section is now
+"bf16 at inference — DISABLED" and documents the current default.
+
 ## ⚠️ Second revision (2026-07-22)
 
 The bayer_excess upsample switch to centered bilinear
