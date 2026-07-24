@@ -36,6 +36,18 @@ Val-derived offset gives 0.8635 hit_n3 on test vs. 0.8630 for
 test-derived — well inside noise. Same overfit-check story as the
 original v3 bias: val-derived is the production number.
 
+**Post-close revision (2026-07-24)** — run7 fp32 refit:
+- run7 val-derived bias: `(−0.436, −0.441)` — materially larger than
+  run3's `(−0.179, −0.023)`. Cross-checkpoint bias is not a shared
+  constant.
+- run7 val hit_n3: 0.9069 (bf16 + own) → **0.9088** (fp32 + own),
+  +0.19 pp.
+- run7 test hit_n3: 0.8620 → **0.8632**, +0.12 pp.
+- Val-derived transfer to test on run7 is imperfect — see
+  `notes/run7_results.md` for the median-vs-mean tension and per-
+  wavelength residual behavior. run3 remains production; run7's
+  bias-offset story is more subtle than run3's.
+
 ## Architecture × inference-constraint ablation matrix (final)
 
 Two architectures × 10 configs on val. See
